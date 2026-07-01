@@ -25,3 +25,8 @@ desktop.ini
 # Temporary files
 *.tmp
 *.bak
+
+# Project generated artifacts
+data/
+model/
+experiments/
