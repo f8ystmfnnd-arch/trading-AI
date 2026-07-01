@@ -5,6 +5,7 @@ Examples:
     python collect_bybit_1m.py --days 365
     python collect_bybit_1m.py --update
     python collect_bybit_1m.py --days 30 --force-refresh
+    python collect_bybit_1m.py --max-history --force-refresh
 """
 
 from __future__ import annotations
@@ -29,6 +30,8 @@ FETCH_LIMIT = 1000
 MAX_RETRIES = 5
 REQUEST_SLEEP_SECONDS = 0.35
 RETRY_SLEEP_SECONDS = 5
+MAX_HISTORY_BATCHES = 10_000
+MAX_EMPTY_RESPONSES = 3
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_PATH = BASE_DIR / "data" / "raw" / "BTCUSDT_1m.csv"
@@ -83,16 +86,35 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Back up the existing raw CSV, then replace it with a fresh --days fetch.",
     )
+    parser.add_argument(
+        "--max-history",
+        action="store_true",
+        help="Fetch as much BTCUSDT 1m history as Bybit provides. Requires --force-refresh.",
+    )
+    parser.add_argument(
+        "--max-batches",
+        type=int,
+        default=MAX_HISTORY_BATCHES,
+        help=f"Safety limit for --max-history pagination. Default: {MAX_HISTORY_BATCHES}.",
+    )
     args = parser.parse_args()
 
     if args.update and args.force_refresh:
         parser.error("--update and --force-refresh cannot be used together.")
     if args.update and args.days is not None:
         parser.error("--update and --days cannot be used together. Use --update by itself.")
+    if args.max_history and args.update:
+        parser.error("--max-history and --update cannot be used together.")
+    if args.max_history and args.days is not None:
+        parser.error("--max-history and --days cannot be used together.")
+    if args.max_history and not args.force_refresh:
+        parser.error("--max-history can replace the current raw CSV, so use it together with --force-refresh.")
     if args.days is not None and args.days <= 0:
         parser.error("--days must be a positive integer.")
+    if args.max_batches <= 0:
+        parser.error("--max-batches must be a positive integer.")
 
-    args.days = DAYS_TO_FETCH if args.days is None else args.days
+    args.days = DAYS_TO_FETCH if args.days is None and not args.max_history else args.days
     return args
 
 
@@ -195,7 +217,7 @@ def normalize_rows(rows: list[list[Any]], end_ms: int) -> pd.DataFrame:
 
 def collect_new_data(exchange: ccxt.bybit, start_ms: int, end_ms: int) -> pd.DataFrame:
     chunks: list[pd.DataFrame] = []
-    cursor_ms = start_ms
+    cursor_ms = max(0, start_ms - ONE_MINUTE_MS)
 
     print(
         "[start] collecting "
@@ -222,6 +244,9 @@ def collect_new_data(exchange: ccxt.bybit, start_ms: int, end_ms: int) -> pd.Dat
             f"last={last_timestamp.isoformat()}"
         )
 
+        if last_ms >= end_ms - ONE_MINUTE_MS:
+            break
+
         if last_ms <= cursor_ms:
             next_cursor_ms = cursor_ms + ONE_MINUTE_MS
         else:
@@ -240,8 +265,78 @@ def collect_new_data(exchange: ccxt.bybit, start_ms: int, end_ms: int) -> pd.Dat
         return pd.DataFrame(columns=COLUMNS)
 
     combined, _ = clean_ohlcv_dataframe(pd.concat(chunks, ignore_index=True))
+    combined = combined[combined["timestamp"] >= pd.Timestamp(utc_from_ms(start_ms))]
+    combined = combined.reset_index(drop=True)
     return combined
 
+
+
+def collect_max_history(exchange: ccxt.bybit, end_ms: int, max_batches: int) -> pd.DataFrame:
+    chunks: list[pd.DataFrame] = []
+    cursor_end_ms = end_ms
+    previous_earliest_ms: int | None = None
+    empty_responses = 0
+
+    print("[mode] max-history")
+    print(f"[start] collecting {SYMBOL} 1m candles backward from {utc_from_ms(end_ms)}")
+    print(f"[safety] max_batches={max_batches:,}, max_empty_responses={MAX_EMPTY_RESPONSES}")
+
+    try:
+        for batch_number in range(1, max_batches + 1):
+            batch_start_ms = max(0, cursor_end_ms - FETCH_LIMIT * ONE_MINUTE_MS)
+            rows = request_kline(exchange, batch_start_ms, cursor_end_ms)
+            chunk = normalize_rows(rows, cursor_end_ms + ONE_MINUTE_MS)
+            chunk = chunk[chunk["timestamp"] < pd.Timestamp(utc_from_ms(cursor_end_ms))]
+
+            if chunk.empty:
+                empty_responses += 1
+                print(
+                    f"[max-history] batch={batch_number:,} rows=0 "
+                    f"empty_responses={empty_responses}/{MAX_EMPTY_RESPONSES}"
+                )
+                if empty_responses >= MAX_EMPTY_RESPONSES:
+                    print("[stop] repeated empty responses; reached the available historical boundary")
+                    break
+                cursor_end_ms = batch_start_ms
+                time.sleep(REQUEST_SLEEP_SECONDS)
+                continue
+
+            empty_responses = 0
+            chunks.append(chunk)
+            earliest = chunk["timestamp"].iloc[0]
+            latest = chunk["timestamp"].iloc[-1]
+            earliest_ms = int(earliest.timestamp() * 1000)
+
+            combined_so_far, _ = clean_ohlcv_dataframe(pd.concat(chunks, ignore_index=True))
+            print(
+                f"[max-history] batch={batch_number:,} rows={len(chunk):,} "
+                f"total={len(combined_so_far):,} "
+                f"earliest={combined_so_far['timestamp'].iloc[0].isoformat()} "
+                f"latest={combined_so_far['timestamp'].iloc[-1].isoformat()}"
+            )
+
+            if previous_earliest_ms is not None and earliest_ms >= previous_earliest_ms:
+                print("[stop] earliest timestamp did not move backward; stopping to avoid a loop")
+                break
+
+            previous_earliest_ms = earliest_ms
+            if earliest_ms <= ONE_MINUTE_MS:
+                print("[stop] reached timestamp near Unix epoch; stopping")
+                break
+
+            # Keep a one-candle overlap while moving backward. Duplicates are removed before saving.
+            cursor_end_ms = earliest_ms + ONE_MINUTE_MS
+            time.sleep(REQUEST_SLEEP_SECONDS)
+        else:
+            print("[stop] max_batches safety limit reached")
+    except KeyboardInterrupt:
+        print("\n[interrupt] KeyboardInterrupt received; saving collected rows so far")
+
+    if not chunks:
+        return pd.DataFrame(columns=COLUMNS)
+
+    combined, _ = clean_ohlcv_dataframe(pd.concat(chunks, ignore_index=True))
+    return combined
 
 def backup_existing_raw() -> Path | None:
     if not OUTPUT_PATH.exists():
@@ -323,6 +418,21 @@ def run_fresh_fetch(days: int, force_refresh: bool) -> None:
     print_dataset_summary(saved_df, removed_duplicates=removed_duplicates, added_rows=len(saved_df))
 
 
+def run_max_history(force_refresh: bool, max_batches: int) -> None:
+    if not force_refresh:
+        raise ValueError("--max-history can replace the current raw CSV, so use it together with --force-refresh.")
+
+    backup_path = backup_existing_raw()
+    end_ms = completed_minute_ms()
+    exchange = create_exchange()
+    new_df = collect_max_history(exchange, end_ms=end_ms, max_batches=max_batches)
+    saved_df, removed_duplicates = combine_and_save(pd.DataFrame(columns=COLUMNS), new_df)
+    print_dataset_summary(saved_df, removed_duplicates=removed_duplicates, added_rows=len(saved_df))
+    print("[mode] requested mode: max-history")
+    print(f"[save] path={OUTPUT_PATH}")
+    print(f"[backup] path={backup_path if backup_path else '-'}")
+
+
 def run_update() -> None:
     if not OUTPUT_PATH.exists():
         print("[update] existing raw CSV was not found.")
@@ -360,6 +470,8 @@ def main() -> None:
     try:
         if args.update:
             run_update()
+        elif args.max_history:
+            run_max_history(force_refresh=args.force_refresh, max_batches=args.max_batches)
         else:
             run_fresh_fetch(days=args.days, force_refresh=args.force_refresh)
     except (RuntimeError, ValueError, OSError) as error:
