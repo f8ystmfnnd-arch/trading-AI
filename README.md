@@ -152,6 +152,8 @@ http://localhost:8501
 - moving averages
 - action hint
 - latest similarity pattern summary
+- 15m Risk Overlay mode: latest 1,000 15m candles with optional MA, Bollinger, high-vol, drop-risk, and NO_TRADE markers
+- 1m Live Micro View: latest 1,000 1m candles with micro volatility, volume spike, and fast move event markers
 
 대시보드가 주로 참조하는 파일:
 
