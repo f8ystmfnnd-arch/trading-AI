@@ -101,11 +101,16 @@ UI_TEXT = {
         "volume_spike_ratio_threshold": "거래량 급증 기준 배율",
         "range_spike_ratio_threshold": "캔들 변동폭 급증 기준 배율",
         "volatility_spike_percentile": "변동성 급증 분위 기준값",
-        "high_vol_probability": "고변동 확률",
-        "drop_risk_probability": "급락위험 확률",
-        "atr_ratio": "ATR 비율",
+        "high_vol_probability": "고변동 가능성",
+        "drop_risk_probability": "급락 위험",
+        "atr_ratio": "평균 변동폭",
         "bb_width": "볼린저밴드 폭",
-        "action_hint": "현재 상태",
+        "action_hint": "시장 상태",
+        "high_vol_help": "가까운 미래에 가격 변동이 평소보다 커질 것으로 모델이 판단한 확률입니다.",
+        "drop_risk_help": "가까운 미래에 큰 가격 하락이 발생할 것으로 모델이 판단한 확률입니다.",
+        "atr_ratio_help": "ATR을 현재 가격으로 나눈 값입니다. 사건 발생 확률이 아니라 현재 가격 대비 평균 변동폭입니다.",
+        "bb_width_help": "상단 볼린저밴드와 하단 볼린저밴드 사이의 폭을 현재 가격 대비 비율로 나타낸 값입니다. 확률이나 위험 점수가 아닙니다.",
+        "action_hint_help": "고변동 가능성, 급락 위험 등 여러 위험 지표를 종합한 현재 시장 상태입니다.",
         "live_btcusdt_price": "실시간 BTCUSDT 가격",
         "return_1m": "1분 수익률",
         "return_5m": "5분 수익률",
@@ -153,6 +158,11 @@ UI_TEXT = {
             "NORMAL": "정상",
             "CAUTION": "주의",
             "NO_TRADE": "진입금지",
+        },
+        "action_descriptions": {
+            "NORMAL": "감지된 시장 위험이 낮은 상태",
+            "CAUTION": "일부 위험 지표가 상승한 상태",
+            "NO_TRADE": "시장 변동 또는 하락 위험이 높아 신규 진입을 피하는 상태",
         },
         "risk_event_columns": {
             "timestamp": "시각",
@@ -212,10 +222,15 @@ UI_TEXT = {
         "range_spike_ratio_threshold": "Range spike ratio threshold",
         "volatility_spike_percentile": "Volatility spike percentile threshold",
         "high_vol_probability": "High-vol probability",
-        "drop_risk_probability": "Drop risk probability",
-        "atr_ratio": "ATR ratio",
-        "bb_width": "BB width",
-        "action_hint": "Action hint",
+        "drop_risk_probability": "Drop risk",
+        "atr_ratio": "Average move width",
+        "bb_width": "Bollinger Band width",
+        "action_hint": "Market state",
+        "high_vol_help": "The model-estimated probability that near-future price movement will be larger than usual.",
+        "drop_risk_help": "The model-estimated probability of a large near-future price drop.",
+        "atr_ratio_help": "ATR divided by current price. This is a volatility ratio, not an event probability.",
+        "bb_width_help": "The distance between upper and lower Bollinger Bands as a ratio of current price. This is not a probability or risk score.",
+        "action_hint_help": "The current market state summarized from multiple risk indicators.",
         "live_btcusdt_price": "Live BTCUSDT price",
         "return_1m": "1m return",
         "return_5m": "5m return",
@@ -264,6 +279,11 @@ UI_TEXT = {
             "CAUTION": "CAUTION",
             "NO_TRADE": "NO_TRADE",
         },
+        "action_descriptions": {
+            "NORMAL": "Low detected market risk",
+            "CAUTION": "Some risk indicators are elevated",
+            "NO_TRADE": "Volatility or downside risk is high enough to avoid new entries",
+        },
         "risk_event_columns": {
             "timestamp": "timestamp",
             "event": "event",
@@ -299,6 +319,13 @@ def t(key: str) -> Any:
 
 def display_action_hint(value: Any) -> str:
     return t("action_labels").get(str(value), str(value))
+
+
+def display_action_with_description(value: Any) -> str:
+    action = str(value)
+    label = display_action_hint(action)
+    description = t("action_descriptions").get(action)
+    return f"{label} - {description}" if description else label
 
 
 def display_event(value: Any) -> str:
@@ -1353,12 +1380,15 @@ def format_number(value: Any, digits: int = 4) -> str:
 
 
 def format_percent(value: Any, digits: int = 2) -> str:
-    if value is None or pd.isna(value):
-        return "N/A"
+    if value is None:
+        return "-"
     try:
-        return f"{float(value) * 100:.{digits}f}%"
+        value_float = float(value)
+        if pd.isna(value_float) or value_float in {float("inf"), float("-inf")}:
+            return "-"
+        return f"{value_float * 100:.{digits}f}%"
     except (TypeError, ValueError):
-        return str(value)
+        return "-"
 
 
 def format_ratio(value: Any, digits: int = 2) -> str:
@@ -1434,11 +1464,31 @@ def render_header_and_risk_cards(
     st.caption(t("normal_caption"))
 
     cols = st.columns(5)
-    cols[0].metric(t("high_vol_probability"), format_number(risk["high_vol"]))
-    cols[1].metric(t("drop_risk_probability"), format_number(risk["drop_risk"]))
-    cols[2].metric(t("atr_ratio"), format_number(risk["atr_ratio_14"], 6))
-    cols[3].metric(t("bb_width"), format_number(risk["bb_width_20"], 6))
-    cols[4].metric(t("action_hint"), display_action_hint(risk["action_hint"]))
+    cols[0].metric(
+        t("high_vol_probability"),
+        format_percent(risk["high_vol"]),
+        help=t("high_vol_help"),
+    )
+    cols[1].metric(
+        t("drop_risk_probability"),
+        format_percent(risk["drop_risk"]),
+        help=t("drop_risk_help"),
+    )
+    cols[2].metric(
+        t("atr_ratio"),
+        format_percent(risk["atr_ratio_14"]),
+        help=t("atr_ratio_help"),
+    )
+    cols[3].metric(
+        t("bb_width"),
+        format_percent(risk["bb_width_20"]),
+        help=t("bb_width_help"),
+    )
+    cols[4].metric(
+        t("action_hint"),
+        display_action_with_description(risk["action_hint"]),
+        help=t("action_hint_help"),
+    )
 
 
 def render_market_chart(
