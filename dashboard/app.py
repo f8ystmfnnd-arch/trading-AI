@@ -25,9 +25,13 @@ DROP_RISK_PREDICTION_PATH = BASE_DIR / "data" / "processed" / "BTCUSDT_15m_drop_
 SIMILARITY_DIR = BASE_DIR / "data" / "processed" / "similarity"
 
 BYBIT_REST_TICKER_URL = "https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT"
+BYBIT_REST_KLINE_URL = "https://api.bybit.com/v5/market/kline"
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
 BYBIT_WS_TOPIC = "tickers.BTCUSDT"
 REST_FALLBACK_MS = 5000
+DATA_CACHE_TTL_SECONDS = 30
+KLINE_CACHE_TTL_SECONDS = 15
+CHART_COMPONENT_HEIGHT = 782
 
 TIMEFRAME_PATHS = {
     "1m": BASE_DIR / "data" / "raw" / "BTCUSDT_1m.csv",
@@ -340,7 +344,7 @@ def display_table(df: pd.DataFrame, columns: list[str], mapping_key: str) -> pd.
     return table.rename(columns=t(mapping_key))
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=DATA_CACHE_TTL_SECONDS)
 def read_csv_tail(path: str, limit: int) -> pd.DataFrame:
     with open(path, "r", encoding="utf-8-sig", errors="replace") as file:
         header = file.readline()
@@ -350,7 +354,7 @@ def read_csv_tail(path: str, limit: int) -> pd.DataFrame:
     return pd.read_csv(StringIO(header + "".join(rows)))
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=DATA_CACHE_TTL_SECONDS)
 def read_csv(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
@@ -373,6 +377,7 @@ def numeric_clean(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     return df.replace([float("inf"), float("-inf")], pd.NA)
 
 
+@st.cache_data(show_spinner=False, ttl=DATA_CACHE_TTL_SECONDS)
 def load_ohlcv(timeframe: str, limit: int) -> tuple[pd.DataFrame | None, str | None]:
     path = TIMEFRAME_PATHS[timeframe]
     if not path.exists():
@@ -390,9 +395,15 @@ def load_ohlcv(timeframe: str, limit: int) -> tuple[pd.DataFrame | None, str | N
     df = df.dropna(subset=OHLC_COLUMNS)
     if df.empty:
         return None, f"{timeframe} candle file has no usable OHLC rows."
+    if timeframe == "1m":
+        df, supplement_warning = supplement_completed_1m_candles(df)
+        df = df.tail(limit)
+        if supplement_warning:
+            return df.reset_index(drop=True), supplement_warning
     return df.reset_index(drop=True), None
 
 
+@st.cache_data(show_spinner=False, ttl=DATA_CACHE_TTL_SECONDS)
 def load_indicators_for_15m(
     limit: int,
     indicator_columns: list[str] | None = None,
@@ -410,6 +421,100 @@ def load_indicators_for_15m(
         return None, "15m indicator file has no usable overlay columns."
     df = numeric_clean(df.loc[:, columns], [column for column in columns if column != "timestamp"])
     return df.reset_index(drop=True), None
+
+
+def completed_minute_ms() -> int:
+    now_ms = int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
+    return now_ms - (now_ms % 60_000)
+
+
+def bybit_kline_url(start_ms: int, end_ms: int, limit: int = 1000) -> str:
+    return (
+        f"{BYBIT_REST_KLINE_URL}?category=spot&symbol=BTCUSDT&interval=1"
+        f"&start={start_ms}&end={end_ms}&limit={limit}"
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=KLINE_CACHE_TTL_SECONDS)
+def fetch_completed_bybit_1m(start_ms: int, end_ms: int) -> pd.DataFrame:
+    if start_ms >= end_ms:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"])
+
+    chunks: list[pd.DataFrame] = []
+    cursor_ms = start_ms
+    while cursor_ms < end_ms:
+        batch_end_ms = min(end_ms, cursor_ms + 1000 * 60_000)
+        with urllib.request.urlopen(bybit_kline_url(cursor_ms, batch_end_ms), timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        rows = payload.get("result", {}).get("list", [])
+        normalized: list[dict[str, Any]] = []
+        for row in rows:
+            if len(row) < 7:
+                continue
+            timestamp_ms = int(row[0])
+            if timestamp_ms < start_ms or timestamp_ms >= end_ms:
+                continue
+            normalized.append(
+                {
+                    "timestamp": pd.to_datetime(timestamp_ms, unit="ms", utc=True),
+                    "open": row[1],
+                    "high": row[2],
+                    "low": row[3],
+                    "close": row[4],
+                    "volume": row[5],
+                    "turnover": row[6],
+                }
+            )
+
+        if not normalized:
+            break
+
+        chunk = pd.DataFrame(normalized)
+        chunk = normalize_timestamp(chunk)
+        for column in ["open", "high", "low", "close", "volume", "turnover"]:
+            chunk[column] = pd.to_numeric(chunk[column], errors="coerce")
+        chunks.append(chunk)
+
+        last_ms = int(chunk["timestamp"].iloc[-1].timestamp() * 1000)
+        next_cursor_ms = last_ms + 60_000
+        if next_cursor_ms <= cursor_ms:
+            break
+        cursor_ms = next_cursor_ms
+
+    if not chunks:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"])
+
+    df = pd.concat(chunks, ignore_index=True)
+    df = normalize_timestamp(df)
+    return df.reset_index(drop=True)
+
+
+def supplement_completed_1m_candles(df: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
+    if df.empty:
+        return df, None
+
+    last_timestamp = df["timestamp"].iloc[-1]
+    start_ms = int(last_timestamp.timestamp() * 1000) + 60_000
+    end_ms = completed_minute_ms()
+    if start_ms >= end_ms:
+        return df, None
+
+    try:
+        supplement = fetch_completed_bybit_1m(start_ms, end_ms)
+    except Exception as exc:
+        return df, f"Failed to supplement completed Bybit 1m candles: {exc}"
+
+    if supplement.empty:
+        return df, "No completed Bybit 1m candles were returned for the missing interval."
+
+    combined = pd.concat([df, supplement], ignore_index=True)
+    combined = normalize_timestamp(combined)
+    for column in ["open", "high", "low", "close", "volume"]:
+        if column in combined.columns:
+            combined[column] = pd.to_numeric(combined[column], errors="coerce")
+    combined = combined.dropna(subset=["timestamp", "open", "high", "low", "close", "volume"])
+    return combined.reset_index(drop=True), None
 
 
 def unix_seconds(series: pd.Series) -> pd.Series:
@@ -468,6 +573,8 @@ def build_lightweight_chart_html(
     indicator_data = indicators_to_chart_data(indicators, candles, selected_indicators)
     latest_close = float(candles.iloc[-1]["close"]) if not candles.empty else None
     initial_live_price = current_price if current_price is not None else latest_close
+    visible_from = candle_data[0]["time"] if candle_data else None
+    visible_to = candle_data[-1]["time"] if candle_data else None
 
     payload = {
         "symbol": "BTCUSDT",
@@ -485,6 +592,8 @@ def build_lightweight_chart_html(
         "wsTopic": BYBIT_WS_TOPIC,
         "restTickerUrl": BYBIT_REST_TICKER_URL,
         "fallbackRestMs": REST_FALLBACK_MS,
+        "visibleFrom": visible_from,
+        "visibleTo": visible_to,
     }
     payload_json = json.dumps(payload, ensure_ascii=False)
 
@@ -740,7 +849,11 @@ def build_lightweight_chart_html(
         }} catch (error) {{}}
       }}
       if (!restoredRange) {{
-        chart.timeScale().fitContent();
+        if (Number.isFinite(payload.visibleFrom) && Number.isFinite(payload.visibleTo)) {{
+          chart.timeScale().setVisibleRange({{ from: payload.visibleFrom, to: payload.visibleTo }});
+        }} else {{
+          chart.timeScale().fitContent();
+        }}
       }}
 
       let rangeSaveTimer = null;
@@ -796,6 +909,11 @@ def build_lightweight_chart_html(
             high: Math.max(Number(currentLastCandle.high), nextPrice),
             low: Math.min(Number(currentLastCandle.low), nextPrice),
           }};
+        }} else if (bucketStart > Number(currentLastCandle.time) + Number(payload.bucketSeconds)) {{
+          showWarning("완성된 1분봉 데이터가 중간에 비어 있어 현재가를 오래된 캔들에 바로 연결하지 않았습니다. 새로고침하거나 데이터 업데이트를 확인하세요.");
+          updatePriceLine(nextPrice);
+          renderHeader();
+          return;
         }} else {{
           currentLastCandle = {{
             time: bucketStart,
@@ -959,6 +1077,7 @@ def find_probability_column(df: pd.DataFrame, tokens: list[str]) -> str | None:
     return None
 
 
+@st.cache_data(show_spinner=False, ttl=DATA_CACHE_TTL_SECONDS)
 def load_overlay_source(
     path: Path,
     label: str,
@@ -1049,6 +1168,7 @@ def load_15m_risk_overlay_data(
     return overlay.reset_index(drop=True), warnings
 
 
+@st.cache_data(show_spinner=False, ttl=DATA_CACHE_TTL_SECONDS)
 def load_1m_micro_candles(limit: int = MICRO_VIEW_CANDLE_COUNT) -> tuple[pd.DataFrame | None, str | None]:
     path = TIMEFRAME_PATHS[MICRO_VIEW_TIMEFRAME]
     if not path.exists():
@@ -1067,6 +1187,10 @@ def load_1m_micro_candles(limit: int = MICRO_VIEW_CANDLE_COUNT) -> tuple[pd.Data
     df = df.dropna(subset=required)
     if df.empty:
         return None, "1m candle file has no usable OHLCV rows."
+    df, supplement_warning = supplement_completed_1m_candles(df)
+    df = df.tail(limit)
+    if supplement_warning:
+        return df.reset_index(drop=True), supplement_warning
     return df.reset_index(drop=True), None
 
 
@@ -1437,6 +1561,24 @@ def current_price_gap_warning(current_price: float | None, latest_close: float |
     return None
 
 
+def render_chart_component(html: str, chart_slot: Any | None, cache_key: str) -> None:
+    st.session_state[f"last_chart_html_{cache_key}"] = html
+    target = chart_slot if chart_slot is not None else st
+    with target.container():
+        components.html(html, height=CHART_COMPONENT_HEIGHT, scrolling=False)
+
+
+def render_previous_chart_on_error(chart_slot: Any | None, cache_key: str, warning: str) -> bool:
+    previous_html = st.session_state.get(f"last_chart_html_{cache_key}")
+    if not previous_html:
+        st.error(warning)
+        return False
+
+    st.warning(f"{warning} 이전 정상 차트를 유지합니다.")
+    render_chart_component(previous_html, chart_slot, cache_key)
+    return True
+
+
 def sidebar_data_status(extra_warnings: list[str]) -> None:
     with st.sidebar.expander(t("data_status"), expanded=False):
         for label, path in {
@@ -1498,10 +1640,13 @@ def render_market_chart(
     live_enabled: bool,
     indicator_columns: list[str] | None = None,
     markers: list[dict[str, Any]] | None = None,
+    chart_slot: Any | None = None,
 ) -> tuple[pd.DataFrame | None, dict[str, Any] | None]:
+    chart_cache_key = f"normal_{timeframe}_{recent_count}"
+    chart_slot = chart_slot or st.empty()
     candles, warning = load_ohlcv(timeframe, recent_count)
     if warning:
-        st.error(warning)
+        render_previous_chart_on_error(chart_slot, chart_cache_key, warning)
         return None, None
     if candles is None:
         return None, None
@@ -1521,7 +1666,7 @@ def render_market_chart(
         indicator_columns=indicator_columns,
         markers=markers,
     )
-    components.html(html, height=782, scrolling=False)
+    render_chart_component(html, chart_slot, chart_cache_key)
 
     sample = candles_to_chart_data(candles)[-1] if not candles.empty else None
     debug = {
@@ -1653,13 +1798,19 @@ def render_micro_risk_cards(features: pd.DataFrame, risk: dict[str, Any], curren
     cols[6].metric(t("action_15m"), display_action_hint(risk["action_hint"]))
 
 
-def render_15m_risk_overlay(action_hint: str, live_enabled: bool, controls: dict[str, Any]) -> dict[str, Any] | None:
+def render_15m_risk_overlay(
+    action_hint: str,
+    live_enabled: bool,
+    controls: dict[str, Any],
+    chart_slot: Any | None = None,
+) -> dict[str, Any] | None:
     st.markdown(f"### {t('risk_overlay_title')}")
     st.caption(t("risk_overlay_caption"))
+    chart_slot = chart_slot or st.empty()
 
     candles, warning = load_ohlcv(RISK_OVERLAY_TIMEFRAME, RISK_OVERLAY_CANDLE_COUNT)
     if warning:
-        st.error(warning)
+        render_previous_chart_on_error(chart_slot, "risk_overlay", warning)
         return None
     if candles is None:
         return None
@@ -1691,7 +1842,7 @@ def render_15m_risk_overlay(action_hint: str, live_enabled: bool, controls: dict
         indicator_columns=indicator_columns,
         markers=markers,
     )
-    components.html(html, height=782, scrolling=False)
+    render_chart_component(html, chart_slot, "risk_overlay")
 
     if controls["show_risk_event_table"]:
         st.markdown(f"#### {t('recent_risk_events')}")
@@ -1736,10 +1887,16 @@ def render_15m_risk_overlay(action_hint: str, live_enabled: bool, controls: dict
     }
 
 
-def render_1m_live_micro_view(risk: dict[str, Any], live_enabled: bool, controls: dict[str, Any]) -> dict[str, Any] | None:
+def render_1m_live_micro_view(
+    risk: dict[str, Any],
+    live_enabled: bool,
+    controls: dict[str, Any],
+    chart_slot: Any | None = None,
+) -> dict[str, Any] | None:
     candles, warning = load_1m_micro_candles(MICRO_VIEW_CANDLE_COUNT)
     if warning:
-        st.error(warning)
+        chart_slot = chart_slot or st.empty()
+        render_previous_chart_on_error(chart_slot, "micro_view", warning)
         return None
     if candles is None:
         return None
@@ -1753,6 +1910,7 @@ def render_1m_live_micro_view(risk: dict[str, Any], live_enabled: bool, controls
     if gap_warning:
         st.warning(gap_warning)
     render_micro_risk_cards(features, risk, current_price)
+    chart_slot = chart_slot or st.empty()
 
     markers, events, raw_event_count, compressed_marker_count, volatility_threshold, range_threshold = build_micro_markers(
         features, controls
@@ -1770,7 +1928,7 @@ def render_1m_live_micro_view(risk: dict[str, Any], live_enabled: bool, controls
         markers=markers,
         current_price=current_price,
     )
-    components.html(html, height=782, scrolling=False)
+    render_chart_component(html, chart_slot, "micro_view")
 
     if controls["show_micro_event_table"]:
         st.markdown(f"#### {t('recent_micro_events')}")
@@ -1859,15 +2017,18 @@ def main() -> None:
     if view_mode == "15m Risk Overlay":
         controls = render_risk_overlay_controls()
         render_header_and_risk_cards(RISK_OVERLAY_TIMEFRAME, risk)
-        debug = render_15m_risk_overlay(risk["action_hint"], live_enabled, controls)
+        with st.spinner("차트 데이터를 불러오는 중입니다..."):
+            debug = render_15m_risk_overlay(risk["action_hint"], live_enabled, controls)
     elif view_mode == "1m Live Micro View":
         controls = render_micro_overlay_controls()
-        debug = render_1m_live_micro_view(risk, live_enabled, controls)
+        with st.spinner("차트 데이터를 불러오는 중입니다..."):
+            debug = render_1m_live_micro_view(risk, live_enabled, controls)
     else:
         timeframe = st.sidebar.selectbox(t("timeframe"), ["1m", "5m", "15m", "1h", "4h", "1d"], index=2)
         recent_count = st.sidebar.selectbox(t("recent_candles"), [100, 200, 300, 500, 1000], index=1)
         render_header_and_risk_cards(timeframe, risk)
-        _, debug = render_market_chart(timeframe, recent_count, risk["action_hint"], live_enabled)
+        with st.spinner("차트 데이터를 불러오는 중입니다..."):
+            _, debug = render_market_chart(timeframe, recent_count, risk["action_hint"], live_enabled)
 
     show_debug(debug)
     show_baseline_comparison()
