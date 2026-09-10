@@ -13,17 +13,21 @@ Run:
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+from evaluation.targets import apply_threshold, fit_training_quantile_threshold
+
 
 BASE_DIR = Path(__file__).resolve().parent
 INPUT_PATH = BASE_DIR / "data" / "processed" / "BTCUSDT_15m_features.csv"
 RESAMPLED_15M_PATH = BASE_DIR / "data" / "resampled" / "BTCUSDT_15m.csv"
 OUTPUT_PATH = BASE_DIR / "data" / "processed" / "BTCUSDT_15m_risk_targets.csv"
+THRESHOLD_METADATA_PATH = BASE_DIR / "data" / "processed" / "risk_target_threshold_metadata.json"
 
 BIG_MOVE_THRESHOLD = 0.01
 DROP_THRESHOLD = 0.01
@@ -39,6 +43,7 @@ NEW_TARGET_COLUMNS = [
     "target_drop_next_4",
     "target_pump_next_4",
     "target_volatility_high_next_4",
+    "label_end_time_4",
 ]
 
 BINARY_TARGET_COLUMNS = [
@@ -117,7 +122,12 @@ def load_features() -> pd.DataFrame:
     return df
 
 
-def add_risk_targets(df: pd.DataFrame) -> tuple[pd.DataFrame, float]:
+def add_risk_targets(
+    df: pd.DataFrame,
+    threshold_fit_end: object | None = None,
+    *,
+    metadata_path: Path | None = None,
+) -> tuple[pd.DataFrame, float]:
     output = df.copy()
     close = output["close"]
 
@@ -128,6 +138,7 @@ def add_risk_targets(df: pd.DataFrame) -> tuple[pd.DataFrame, float]:
     output["target_volatility_next_4"] = (
         one_bar_return.shift(-1).rolling(FORWARD_BARS).std().shift(-(FORWARD_BARS - 1))
     )
+    output["label_end_time_4"] = pd.to_datetime(output["timestamp"], utc=True).shift(-FORWARD_BARS)
 
     output["target_big_move_next_4"] = (
         output["target_abs_return_next_4"] >= BIG_MOVE_THRESHOLD
@@ -135,10 +146,29 @@ def add_risk_targets(df: pd.DataFrame) -> tuple[pd.DataFrame, float]:
     output["target_drop_next_4"] = (output["target_return_next_4"] <= -DROP_THRESHOLD).astype(int)
     output["target_pump_next_4"] = (output["target_return_next_4"] >= PUMP_THRESHOLD).astype(int)
 
-    volatility_threshold = float(output["target_volatility_next_4"].quantile(HIGH_VOL_QUANTILE))
-    output["target_volatility_high_next_4"] = (
-        output["target_volatility_next_4"] >= volatility_threshold
-    ).astype(int)
+    confirmed = output["target_volatility_next_4"].notna()
+    if threshold_fit_end is None:
+        confirmed_times = pd.to_datetime(output.loc[confirmed, "timestamp"], utc=True)
+        train_end = int(len(confirmed_times) * 0.70)
+        if train_end <= 0 or train_end >= len(confirmed_times):
+            raise ValueError("Not enough confirmed labels to fit the volatility threshold")
+        threshold_fit_end = confirmed_times.iloc[train_end]
+    threshold = fit_training_quantile_threshold(
+        output["target_volatility_next_4"],
+        output["timestamp"],
+        threshold_fit_end,
+        label_end_time=output["label_end_time_4"],
+        percentile=HIGH_VOL_QUANTILE,
+        horizon=FORWARD_BARS,
+        target_type="future_volatility",
+    )
+    volatility_threshold = threshold.value
+    output["target_volatility_high_next_4"] = apply_threshold(
+        output["target_volatility_next_4"], threshold
+    )
+    if metadata_path is not None:
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        metadata_path.write_text(json.dumps(threshold.metadata(), indent=2), encoding="utf-8")
 
     print(f"[target] volatility threshold q={HIGH_VOL_QUANTILE:.2f}: {volatility_threshold:.8f}")
     return output, volatility_threshold
@@ -183,7 +213,7 @@ def save_output(df: pd.DataFrame) -> None:
 
 def main() -> None:
     df = load_features()
-    df, _ = add_risk_targets(df)
+    df, _ = add_risk_targets(df, metadata_path=THRESHOLD_METADATA_PATH)
     output_df = clean_output(df)
     print_target_columns()
     print_binary_target_ratios(output_df)

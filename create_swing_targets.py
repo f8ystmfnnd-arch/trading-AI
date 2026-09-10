@@ -13,17 +13,21 @@ Run:
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+from evaluation.targets import apply_threshold, fit_training_quantile_threshold
+
 
 BASE_DIR = Path(__file__).resolve().parent
 INPUT_PATH = BASE_DIR / "data" / "processed" / "BTCUSDT_15m_features.csv"
 RESAMPLED_15M_PATH = BASE_DIR / "data" / "resampled" / "BTCUSDT_15m.csv"
 OUTPUT_PATH = BASE_DIR / "data" / "processed" / "BTCUSDT_15m_swing_targets.csv"
+THRESHOLD_METADATA_PATH = BASE_DIR / "data" / "processed" / "swing_target_threshold_metadata.json"
 
 BIG_MOVE_THRESHOLD_16 = 0.02
 DROP_THRESHOLD_16 = 0.02
@@ -44,6 +48,7 @@ NEW_TARGET_COLUMNS = [
     "target_drop_next_16",
     "target_pump_next_16",
     "target_volatility_high_next_16",
+    "label_end_time_16",
     "target_return_next_96",
     "target_abs_return_next_96",
     "target_volatility_next_96",
@@ -51,6 +56,7 @@ NEW_TARGET_COLUMNS = [
     "target_drop_next_96",
     "target_pump_next_96",
     "target_volatility_high_next_96",
+    "label_end_time_96",
 ]
 
 BINARY_TARGET_COLUMNS = [
@@ -145,7 +151,11 @@ def thresholds_for_horizon(horizon: int) -> tuple[float, float, float]:
     raise ValueError(f"Unsupported horizon: {horizon}")
 
 
-def add_horizon_targets(df: pd.DataFrame, horizon: int) -> tuple[pd.DataFrame, float]:
+def add_horizon_targets(
+    df: pd.DataFrame,
+    horizon: int,
+    threshold_fit_end: object | None = None,
+) -> tuple[pd.DataFrame, float]:
     output = df.copy()
     big_move_threshold, drop_threshold, pump_threshold = thresholds_for_horizon(horizon)
 
@@ -156,25 +166,63 @@ def add_horizon_targets(df: pd.DataFrame, horizon: int) -> tuple[pd.DataFrame, f
     drop_col = f"target_drop_next_{horizon}"
     pump_col = f"target_pump_next_{horizon}"
     high_vol_col = f"target_volatility_high_next_{horizon}"
+    label_end_col = f"label_end_time_{horizon}"
 
     output[return_col] = calculate_future_return(output["close"], horizon)
     output[abs_col] = output[return_col].abs()
     output[vol_col] = calculate_future_volatility(output["close"], horizon)
+    output[label_end_col] = pd.to_datetime(output["timestamp"], utc=True).shift(-horizon)
 
-    volatility_threshold = float(output[vol_col].quantile(HIGH_VOL_QUANTILE))
+    confirmed = output[vol_col].notna()
+    if threshold_fit_end is None:
+        confirmed_times = pd.to_datetime(output.loc[confirmed, "timestamp"], utc=True)
+        train_end = int(len(confirmed_times) * 0.70)
+        if train_end <= 0 or train_end >= len(confirmed_times):
+            raise ValueError(f"Not enough confirmed labels to fit next_{horizon} threshold")
+        threshold_fit_end = confirmed_times.iloc[train_end]
+    threshold = fit_training_quantile_threshold(
+        output[vol_col],
+        output["timestamp"],
+        threshold_fit_end,
+        label_end_time=output[label_end_col],
+        percentile=HIGH_VOL_QUANTILE,
+        horizon=horizon,
+        target_type="future_volatility",
+    )
+    volatility_threshold = threshold.value
     output[big_col] = (output[abs_col] >= big_move_threshold).astype(int)
     output[drop_col] = (output[return_col] <= -drop_threshold).astype(int)
     output[pump_col] = (output[return_col] >= pump_threshold).astype(int)
-    output[high_vol_col] = (output[vol_col] >= volatility_threshold).astype(int)
+    output[high_vol_col] = apply_threshold(output[vol_col], threshold)
 
     print(f"[target] next_{horizon} volatility high threshold q={HIGH_VOL_QUANTILE:.2f}: {volatility_threshold:.8f}")
     return output, volatility_threshold
 
 
-def add_swing_targets(df: pd.DataFrame) -> pd.DataFrame:
+def add_swing_targets(
+    df: pd.DataFrame,
+    threshold_fit_end: object | None = None,
+    *,
+    metadata_path: Path | None = None,
+) -> pd.DataFrame:
     output = df.copy()
+    metadata: dict[str, object] = {}
     for horizon in HORIZONS:
-        output, _ = add_horizon_targets(output, horizon)
+        output, threshold = add_horizon_targets(output, horizon, threshold_fit_end)
+        valid = output[f"target_volatility_next_{horizon}"].notna()
+        fit_end = threshold_fit_end
+        if fit_end is None:
+            times = pd.to_datetime(output.loc[valid, "timestamp"], utc=True)
+            fit_end = times.iloc[int(len(times) * 0.70)]
+        fitted = fit_training_quantile_threshold(
+            output[f"target_volatility_next_{horizon}"], output["timestamp"], fit_end,
+            label_end_time=output[f"label_end_time_{horizon}"], percentile=HIGH_VOL_QUANTILE,
+            horizon=horizon, target_type="future_volatility",
+        )
+        metadata[str(horizon)] = fitted.metadata()
+    if metadata_path is not None:
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     return output
 
 
@@ -213,7 +261,7 @@ def save_output(df: pd.DataFrame) -> None:
 
 def main() -> None:
     df, _, _, _ = load_features()
-    df = add_swing_targets(df)
+    df = add_swing_targets(df, metadata_path=THRESHOLD_METADATA_PATH)
     output_df, _ = clean_output(df)
     print_target_columns()
     print_class_ratios(output_df)

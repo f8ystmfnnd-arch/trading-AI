@@ -22,6 +22,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from evaluation.splits import purged_chronological_split
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 MPL_CONFIG_DIR = SCRIPT_DIR / ".matplotlib_cache"
@@ -140,16 +142,11 @@ def print_period(name: str, df: pd.DataFrame) -> None:
 
 
 def split_time_series(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    row_count = len(df)
-    train_end = int(row_count * 0.70)
-    validation_end = int(row_count * 0.85)
-
-    if train_end <= 0 or validation_end <= train_end or validation_end >= row_count:
-        raise ValueError("Not enough rows to split into 70% train, 15% validation, 15% test.")
-
-    train_df = df.iloc[:train_end].copy()
-    validation_df = df.iloc[train_end:validation_end].copy()
-    test_df = df.iloc[validation_end:].copy()
+    train_df, validation_df, test_df, metadata = purged_chronological_split(df, 1)
+    print(
+        f"[purge] train {metadata.train_rows_before_purge}->{metadata.train_rows_after_purge}, "
+        f"validation {metadata.validation_rows_before_purge}->{metadata.validation_rows_after_purge}"
+    )
 
     print_period("train", train_df)
     print_period("validation", validation_df)
@@ -222,19 +219,38 @@ def evaluate_split(model: XGBClassifier, name: str, df: pd.DataFrame, feature_co
     return probabilities
 
 
-def save_predictions(model: XGBClassifier, test_df: pd.DataFrame, feature_columns: list[str]) -> None:
-    probabilities = model.predict_proba(test_df[feature_columns])
-    pred_label = (probabilities[:, 1] >= 0.5).astype(int)
-
-    prediction_df = pd.DataFrame(
+def prediction_frame(
+    model: XGBClassifier,
+    frame: pd.DataFrame,
+    feature_columns: list[str],
+    split: str,
+) -> pd.DataFrame:
+    probabilities = model.predict_proba(frame[feature_columns])
+    return pd.DataFrame(
         {
-            "timestamp": test_df["timestamp"],
-            "target_up_next": test_df[TARGET_COLUMN].astype(int),
-            "target_return_next": test_df[RETURN_ANALYSIS_COLUMN],
+            "timestamp": frame["timestamp"],
+            "split": split,
+            "target_up_next": frame[TARGET_COLUMN].astype(int),
+            "target_return_next": frame[RETURN_ANALYSIS_COLUMN],
             "pred_proba_down": probabilities[:, 0],
             "pred_proba_up": probabilities[:, 1],
-            "pred_label": pred_label,
+            "pred_label": (probabilities[:, 1] >= 0.5).astype(int),
         }
+    )
+
+
+def save_predictions(
+    model: XGBClassifier,
+    validation_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    feature_columns: list[str],
+) -> None:
+    prediction_df = pd.concat(
+        [
+            prediction_frame(model, validation_df, feature_columns, "validation"),
+            prediction_frame(model, test_df, feature_columns, "test"),
+        ],
+        ignore_index=True,
     )
 
     PREDICTION_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -282,7 +298,7 @@ def main() -> None:
 
     plot_feature_importance(model, feature_columns)
     save_model(model)
-    save_predictions(model, test_df, feature_columns)
+    save_predictions(model, validation_df, test_df, feature_columns)
 
 
 if __name__ == "__main__":

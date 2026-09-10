@@ -24,6 +24,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from evaluation.splits import purged_chronological_split
+from evaluation.targets import apply_threshold, fit_training_quantile_threshold
+
 try:
     from sklearn.metrics import (
         accuracy_score,
@@ -112,8 +115,10 @@ def load_dataset() -> pd.DataFrame:
     print(f"[rows] input features rows: {len(features):,}")
     print(f"[rows] input risk target rows: {len(risk_targets):,}")
 
-    if TARGET_COLUMN not in risk_targets.columns:
-        raise ValueError(f"Risk target file is missing required target column: {TARGET_COLUMN}")
+    required_targets = {TARGET_COLUMN, "target_volatility_next_4"}
+    missing_targets = sorted(required_targets - set(risk_targets.columns))
+    if missing_targets:
+        raise ValueError(f"Risk target file is missing required columns: {missing_targets}")
 
     risk_columns = ["timestamp"]
     if "close" in risk_targets.columns and "close" not in risk_columns:
@@ -191,15 +196,17 @@ def print_class_ratio(name: str, y: pd.Series) -> None:
 
 
 def split_time_series(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    row_count = len(df)
-    train_end = int(row_count * 0.70)
-    validation_end = int(row_count * 0.85)
-    if train_end <= 0 or validation_end <= train_end or validation_end >= row_count:
-        raise ValueError("Not enough rows to split into 70/15/15 train/validation/test sets.")
-
-    train_df = df.iloc[:train_end].copy()
-    validation_df = df.iloc[train_end:validation_end].copy()
-    test_df = df.iloc[validation_end:].copy()
+    train_df, validation_df, test_df, metadata = purged_chronological_split(df, 4)
+    threshold = fit_training_quantile_threshold(
+        train_df["target_volatility_next_4"], train_df["timestamp"], train_df["timestamp"].iloc[-1],
+        percentile=0.70, horizon=4, target_type="future_volatility",
+    )
+    for split in (train_df, validation_df, test_df):
+        split[TARGET_COLUMN] = apply_threshold(split["target_volatility_next_4"], threshold).astype(int)
+    print(
+        f"[purge] train {metadata.train_rows_before_purge}->{metadata.train_rows_after_purge}, "
+        f"validation {metadata.validation_rows_before_purge}->{metadata.validation_rows_after_purge}"
+    )
 
     print(f"[split] train rows: {len(train_df):,}")
     print(f"[split] validation rows: {len(validation_df):,}")

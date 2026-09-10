@@ -21,6 +21,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from risk.policy import (
+    DROP_RISK_THRESHOLDS,
+    HIGH_VOL_THRESHOLDS,
+    action_from_levels,
+    risk_level,
+)
+
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = BASE_DIR / "data" / "processed" / "similarity"
@@ -218,14 +225,6 @@ def top_k_similar(
     return result, candidate_count
 
 
-def risk_level(value: float, high_cutoff: float, medium_cutoff: float) -> str:
-    if value >= high_cutoff:
-        return "HIGH"
-    if value >= medium_cutoff:
-        return "MEDIUM"
-    return "LOW"
-
-
 def direction_hint(up_ratio: float) -> str:
     if up_ratio >= 0.60:
         return "BULLISH_HINT"
@@ -235,13 +234,7 @@ def direction_hint(up_ratio: float) -> str:
 
 
 def action_hint(high_vol_level: str, drop_risk_level: str) -> str:
-    if high_vol_level == "HIGH" and drop_risk_level in {"MEDIUM", "HIGH"}:
-        return "NO_TRADE"
-    if high_vol_level == "HIGH":
-        return "CAUTION"
-    if drop_risk_level == "MEDIUM":
-        return "CAUTION"
-    return "NORMAL"
+    return action_from_levels(high_vol_level, drop_risk_level)
 
 
 def summarize(
@@ -258,8 +251,8 @@ def summarize(
     similar_high_vol_ratio = float(top_df["target_volatility_high_next_4"].mean())
     similar_drop_ratio = float(top_df["target_drop_next_4"].mean())
     similar_big_move_ratio = float(top_df["target_big_move_next_4"].mean())
-    high_vol = risk_level(similar_high_vol_ratio, high_cutoff=0.60, medium_cutoff=0.40)
-    drop_risk = risk_level(similar_drop_ratio, high_cutoff=0.15, medium_cutoff=0.07)
+    high_vol = risk_level(similar_high_vol_ratio, HIGH_VOL_THRESHOLDS)
+    drop_risk = risk_level(similar_drop_ratio, DROP_RISK_THRESHOLDS)
     direction = direction_hint(similar_up_ratio)
     action = action_hint(high_vol, drop_risk)
 

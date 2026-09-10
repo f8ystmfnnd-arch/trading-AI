@@ -22,6 +22,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from evaluation.thresholds import evaluate_fixed_threshold, select_threshold_on_validation
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 MPL_CONFIG_DIR = SCRIPT_DIR / ".matplotlib_cache"
@@ -46,6 +48,7 @@ THRESHOLDS = [0.55, 0.60, 0.65, 0.70, 0.75]
 FEE_PER_TRADE = 0.0006
 REQUIRED_COLUMNS = [
     "timestamp",
+    "split",
     "target_up_next",
     "target_return_next",
     "pred_proba_down",
@@ -178,18 +181,6 @@ def print_summary(summary_df: pd.DataFrame) -> None:
         print(summary_df[display_columns].to_string(index=False))
 
 
-def select_best_threshold(summary_df: pd.DataFrame) -> float:
-    sortable = summary_df.copy()
-    sortable["profit_factor_sort"] = sortable["profit_factor"].replace(np.inf, 1_000_000.0)
-    best_row = sortable.sort_values(
-        ["total_return", "max_drawdown", "profit_factor_sort"],
-        ascending=[False, False, False],
-    ).iloc[0]
-    best_threshold = float(best_row["threshold"])
-    print(f"[best] threshold={best_threshold:.2f} selected by highest total return")
-    return best_threshold
-
-
 def save_summary(summary_df: pd.DataFrame) -> None:
     SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
     summary_df.to_csv(SUMMARY_PATH, index=False)
@@ -213,7 +204,7 @@ def save_detail(detail_df: pd.DataFrame, threshold: float) -> None:
         "buy_hold_equity_curve",
     ]
     output[columns].to_csv(DETAIL_PATH, index=False)
-    print(f"[save] best-threshold detail rows={len(output):,} path={DETAIL_PATH}")
+    print(f"[save] validation-selected threshold detail rows={len(output):,} path={DETAIL_PATH}")
 
 
 def plot_equity_curve(detail_df: pd.DataFrame, threshold: float) -> None:
@@ -234,22 +225,28 @@ def plot_equity_curve(detail_df: pd.DataFrame, threshold: float) -> None:
 
 def main() -> None:
     predictions = load_predictions()
+    validation = predictions.loc[predictions["split"] == "validation"].reset_index(drop=True)
+    test = predictions.loc[predictions["split"] == "test"].reset_index(drop=True)
+    if validation.empty or test.empty:
+        raise ValueError("Predictions must contain non-empty validation and test splits")
 
-    summaries: list[dict[str, float]] = []
-    details_by_threshold: dict[float, pd.DataFrame] = {}
-    for threshold in THRESHOLDS:
-        summary, detail_df = backtest_threshold(predictions, threshold)
-        summaries.append(summary)
-        details_by_threshold[threshold] = detail_df
+    selected_threshold, validation_summary = select_threshold_on_validation(
+        validation, THRESHOLDS, backtest_threshold
+    )
+    validation_summary.insert(0, "phase", "validation_tuning")
+    print("\n[validation threshold tuning]")
+    print_summary(validation_summary)
+    print(f"[selected] threshold={selected_threshold:.2f} from validation only")
 
-    summary_df = pd.DataFrame(summaries)
-    print_summary(summary_df)
-    save_summary(summary_df)
-
-    best_threshold = select_best_threshold(summary_df)
-    best_detail = details_by_threshold[best_threshold]
-    save_detail(best_detail, best_threshold)
-    plot_equity_curve(best_detail, best_threshold)
+    test_summary, test_detail = evaluate_fixed_threshold(
+        test, selected_threshold, backtest_threshold
+    )
+    test_summary_df = pd.DataFrame([{**test_summary, "phase": "final_test"}])
+    print("\n[FINAL TEST PERFORMANCE - fixed validation threshold]")
+    print_summary(test_summary_df)
+    save_summary(pd.concat([validation_summary, test_summary_df], ignore_index=True))
+    save_detail(test_detail, selected_threshold)
+    plot_equity_curve(test_detail, selected_threshold)
 
 
 if __name__ == "__main__":

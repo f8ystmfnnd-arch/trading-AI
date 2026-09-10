@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import urllib.request
 from collections import deque
 from io import StringIO
@@ -13,43 +15,60 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-
 BASE_DIR = Path(__file__).resolve().parents[1]
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
 
-CANDLE_15M_PATH = BASE_DIR / "data" / "resampled" / "BTCUSDT_15m.csv"
-FEATURE_PATH = BASE_DIR / "data" / "processed" / "BTCUSDT_15m_features_with_indicators.csv"
-VOLATILITY_PREDICTION_PATH = (
-    BASE_DIR / "data" / "processed" / "BTCUSDT_15m_volatility_predictions_with_indicators.csv"
+DATA_DIR = Path(os.environ.get("TRADING_AI_DATA_DIR", BASE_DIR / "data"))
+
+from market.instrument import (
+    BYBIT_CATEGORY,
+    BYBIT_EXCHANGE,
+    BYBIT_REST_TICKER_URL,
+    BYBIT_SYMBOL,
+    BYBIT_WS_URL,
 )
-DROP_RISK_PREDICTION_PATH = BASE_DIR / "data" / "processed" / "BTCUSDT_15m_drop_risk_predictions.csv"
-SIMILARITY_DIR = BASE_DIR / "data" / "processed" / "similarity"
+from risk.policy import (
+    CAUTION,
+    DROP_RISK_THRESHOLDS,
+    HIGH_VOL_THRESHOLDS,
+    NO_TRADE,
+    STALE,
+    UNKNOWN,
+    action_from_probabilities,
+    decide_action,
+    evaluate_snapshot,
+)
 
-BYBIT_REST_TICKER_URL = "https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT"
+CANDLE_15M_PATH = DATA_DIR / "resampled" / "BTCUSDT_15m.csv"
+FEATURE_PATH = DATA_DIR / "processed" / "BTCUSDT_15m_features_with_indicators.csv"
+VOLATILITY_PREDICTION_PATH = (
+    DATA_DIR / "processed" / "BTCUSDT_15m_volatility_predictions_with_indicators.csv"
+)
+DROP_RISK_PREDICTION_PATH = DATA_DIR / "processed" / "BTCUSDT_15m_drop_risk_predictions.csv"
+SIMILARITY_DIR = DATA_DIR / "processed" / "similarity"
+
+INSTRUMENT = f"{BYBIT_EXCHANGE}:{BYBIT_CATEGORY}:{BYBIT_SYMBOL}"
 BYBIT_REST_KLINE_URL = "https://api.bybit.com/v5/market/kline"
-BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
-BYBIT_WS_TOPIC = "tickers.BTCUSDT"
+BYBIT_WS_TOPIC = f"tickers.{BYBIT_SYMBOL}"
 REST_FALLBACK_MS = 5000
 DATA_CACHE_TTL_SECONDS = 30
 KLINE_CACHE_TTL_SECONDS = 15
 CHART_COMPONENT_HEIGHT = 782
 
 TIMEFRAME_PATHS = {
-    "1m": BASE_DIR / "data" / "raw" / "BTCUSDT_1m.csv",
-    "5m": BASE_DIR / "data" / "resampled" / "BTCUSDT_5m.csv",
-    "15m": BASE_DIR / "data" / "resampled" / "BTCUSDT_15m.csv",
-    "1h": BASE_DIR / "data" / "resampled" / "BTCUSDT_1h.csv",
-    "4h": BASE_DIR / "data" / "resampled" / "BTCUSDT_4h.csv",
-    "1d": BASE_DIR / "data" / "resampled" / "BTCUSDT_1d.csv",
+    "1m": DATA_DIR / "raw" / "BTCUSDT_1m.csv",
+    "5m": DATA_DIR / "resampled" / "BTCUSDT_5m.csv",
+    "15m": DATA_DIR / "resampled" / "BTCUSDT_15m.csv",
+    "1h": DATA_DIR / "resampled" / "BTCUSDT_1h.csv",
+    "4h": DATA_DIR / "resampled" / "BTCUSDT_4h.csv",
+    "1d": DATA_DIR / "resampled" / "BTCUSDT_1d.csv",
 }
 
 OHLC_COLUMNS = ["timestamp", "open", "high", "low", "close"]
 MA_INDICATOR_COLUMNS = ["ma_20", "ma_60", "ma_120"]
 BB_INDICATOR_COLUMNS = ["bb_upper_20", "bb_lower_20"]
 DEFAULT_INDICATOR_COLUMNS = [*MA_INDICATOR_COLUMNS, *BB_INDICATOR_COLUMNS]
-DEFAULT_HIGH_VOL_MARKER_THRESHOLD = 0.80
-DEFAULT_DROP_RISK_MARKER_THRESHOLD = 0.25
-DEFAULT_NO_TRADE_HIGH_VOL_THRESHOLD = 0.85
-DEFAULT_NO_TRADE_DROP_RISK_THRESHOLD = 0.30
 RISK_OVERLAY_TIMEFRAME = "15m"
 RISK_OVERLAY_CANDLE_COUNT = 1000
 MICRO_VIEW_TIMEFRAME = "1m"
@@ -91,10 +110,6 @@ UI_TEXT = {
         "show_no_trade_markers": "진입금지 마커 표시",
         "show_risk_event_table": "리스크 이벤트 표 표시",
         "show_marker_events_only_in_table": "차트에 찍힌 이벤트만 표에 표시",
-        "high_vol_marker_threshold": "고변동 마커 기준값",
-        "drop_risk_marker_threshold": "급락위험 마커 기준값",
-        "no_trade_high_vol_threshold": "진입금지 고변동 기준값",
-        "no_trade_drop_risk_threshold": "진입금지 급락위험 기준값",
         "show_volatility_spike_markers": "변동성 급증 마커 표시",
         "show_volume_spike_markers": "거래량 급증 마커 표시",
         "show_fast_drop_markers": "단기 급락 마커 표시",
@@ -149,6 +164,7 @@ UI_TEXT = {
         ),
         "live_price_line": "실시간 BTCUSDT",
         "event_labels": {
+            "UNKNOWN": "판단 불가",
             "NO_TRADE": "진입금지",
             "HIGH_VOL": "고변동",
             "DROP_RISK": "급락",
@@ -159,11 +175,15 @@ UI_TEXT = {
             "RANGE_SPIKE": "변동폭",
         },
         "action_labels": {
+            "UNKNOWN": "판단 불가",
+            "STALE": "오래된 판단",
             "NORMAL": "정상",
             "CAUTION": "주의",
             "NO_TRADE": "진입금지",
         },
         "action_descriptions": {
+            "UNKNOWN": "예측값 또는 최신성 정보가 없어 시장 상태를 확인할 수 없음",
+            "STALE": "예측 유효 시간이 지나 현재 판단에 사용할 수 없음",
             "NORMAL": "감지된 시장 위험이 낮은 상태",
             "CAUTION": "일부 위험 지표가 상승한 상태",
             "NO_TRADE": "시장 변동 또는 하락 위험이 높아 신규 진입을 피하는 상태",
@@ -211,10 +231,6 @@ UI_TEXT = {
         "show_no_trade_markers": "Show NO_TRADE markers",
         "show_risk_event_table": "Show Risk event table",
         "show_marker_events_only_in_table": "Show marker events only in table",
-        "high_vol_marker_threshold": "High-vol marker threshold",
-        "drop_risk_marker_threshold": "Drop-risk marker threshold",
-        "no_trade_high_vol_threshold": "NO_TRADE high-vol threshold",
-        "no_trade_drop_risk_threshold": "NO_TRADE drop-risk threshold",
         "show_volatility_spike_markers": "Show volatility spike markers",
         "show_volume_spike_markers": "Show volume spike markers",
         "show_fast_drop_markers": "Show fast drop markers",
@@ -269,6 +285,7 @@ UI_TEXT = {
         ),
         "live_price_line": "Live BTCUSDT",
         "event_labels": {
+            "UNKNOWN": "UNKNOWN",
             "NO_TRADE": "NO TRADE",
             "HIGH_VOL": "HIGH VOL",
             "DROP_RISK": "DROP",
@@ -279,11 +296,15 @@ UI_TEXT = {
             "RANGE_SPIKE": "RANGE",
         },
         "action_labels": {
+            "UNKNOWN": "UNKNOWN",
+            "STALE": "STALE",
             "NORMAL": "NORMAL",
             "CAUTION": "CAUTION",
             "NO_TRADE": "NO_TRADE",
         },
         "action_descriptions": {
+            "UNKNOWN": "Prediction values or freshness metadata are unavailable",
+            "STALE": "The prediction has expired and cannot describe the current market",
             "NORMAL": "Low detected market risk",
             "CAUTION": "Some risk indicators are elevated",
             "NO_TRADE": "Volatility or downside risk is high enough to avoid new entries",
@@ -430,7 +451,7 @@ def completed_minute_ms() -> int:
 
 def bybit_kline_url(start_ms: int, end_ms: int, limit: int = 1000) -> str:
     return (
-        f"{BYBIT_REST_KLINE_URL}?category=spot&symbol=BTCUSDT&interval=1"
+        f"{BYBIT_REST_KLINE_URL}?category={BYBIT_CATEGORY}&symbol={BYBIT_SYMBOL}&interval=1"
         f"&start={start_ms}&end={end_ms}&limit={limit}"
     )
 
@@ -1322,27 +1343,15 @@ def risk_overlay_state(row: pd.Series, controls: dict[str, Any]) -> tuple[str, s
     high_vol_value = None if pd.isna(high_vol) else float(high_vol)
     drop_value = None if pd.isna(drop) else float(drop)
 
-    reasons = []
-    no_trade_high_vol = (
-        high_vol_value is not None and high_vol_value >= controls["no_trade_high_vol_threshold"]
-    )
-    no_trade_drop = (
-        drop_value is not None and drop_value >= controls["no_trade_drop_risk_threshold"]
-    )
-    if no_trade_high_vol:
-        reasons.append(f"high-vol >= {controls['no_trade_high_vol_threshold']:.2f}")
-    if no_trade_drop:
-        reasons.append(f"drop-risk >= {controls['no_trade_drop_risk_threshold']:.2f}")
-    if no_trade_high_vol or no_trade_drop:
-        return "NO_TRADE", ", ".join(reasons)
-
-    drop_hit = drop_value is not None and drop_value >= controls["drop_risk_marker_threshold"]
-    if drop_hit:
-        return "DROP_RISK", f"drop-risk >= {controls['drop_risk_marker_threshold']:.2f}"
-
-    high_vol_hit = high_vol_value is not None and high_vol_value >= controls["high_vol_marker_threshold"]
-    if high_vol_hit:
-        return "HIGH_VOL", f"high-vol >= {controls['high_vol_marker_threshold']:.2f}"
+    action = action_from_probabilities(high_vol_value, drop_value)
+    if action == NO_TRADE:
+        return NO_TRADE, "shared risk policy: at least one risk is HIGH"
+    if action == CAUTION:
+        if drop_value is not None and drop_value >= DROP_RISK_THRESHOLDS.medium:
+            return "DROP_RISK", f"drop-risk >= {DROP_RISK_THRESHOLDS.medium:.2f}"
+        return "HIGH_VOL", f"high-vol >= {HIGH_VOL_THRESHOLDS.medium:.2f}"
+    if action == UNKNOWN:
+        return UNKNOWN, "risk probability is missing or invalid"
 
     return "NORMAL", ""
 
@@ -1448,14 +1457,20 @@ def risk_context() -> tuple[dict[str, Any], list[str]]:
         "drop_risk": None,
         "atr_ratio_14": None,
         "bb_width_20": None,
-        "action_hint": "NORMAL",
+        "feature_asof": None,
+        "predicted_at": None,
+        "valid_until": None,
+        "action_hint": UNKNOWN,
+        "action_reason": "risk predictions have not been validated",
     }
 
     vol_df, warning = load_latest_row(VOLATILITY_PREDICTION_PATH, "high-vol predictions")
+    vol_latest = None
     if warning:
         warnings.append(warning)
     elif vol_df is not None and not vol_df.empty and "pred_proba_high_vol" in vol_df.columns:
-        context["high_vol"] = pd.to_numeric(vol_df.iloc[-1]["pred_proba_high_vol"], errors="coerce")
+        vol_latest = vol_df.iloc[-1]
+        context["high_vol"] = pd.to_numeric(vol_latest["pred_proba_high_vol"], errors="coerce")
 
     feature_df, warning = load_latest_row(FEATURE_PATH, "features with indicators")
     if warning:
@@ -1467,31 +1482,67 @@ def risk_context() -> tuple[dict[str, Any], list[str]]:
                 context[column] = pd.to_numeric(latest[column], errors="coerce")
 
     drop_df, warning = load_latest_row(DROP_RISK_PREDICTION_PATH, "drop-risk predictions")
+    drop_latest = None
     if warning:
         warnings.append(warning)
     elif drop_df is not None and not drop_df.empty:
         drop_column = find_probability_column(drop_df, ["drop"])
         if drop_column:
-            context["drop_risk"] = pd.to_numeric(drop_df.iloc[-1][drop_column], errors="coerce")
+            drop_latest = drop_df.iloc[-1]
+            context["drop_risk"] = pd.to_numeric(drop_latest[drop_column], errors="coerce")
 
     _, _, similarity_warning = latest_similarity_summary()
     if similarity_warning:
         warnings.append(similarity_warning)
 
-    context["action_hint"] = decide_action(context["high_vol"], context["drop_risk"])
+    metadata_columns = ["feature_asof", "predicted_at", "valid_until"]
+    metadata_available = (
+        vol_latest is not None
+        and drop_latest is not None
+        and all(column in vol_latest.index and column in drop_latest.index for column in metadata_columns)
+    )
+    timestamps_match = False
+    if metadata_available:
+        vol_timestamp = pd.to_datetime(vol_latest.get("timestamp"), utc=True, errors="coerce")
+        drop_timestamp = pd.to_datetime(drop_latest.get("timestamp"), utc=True, errors="coerce")
+        vol_feature_asof = pd.to_datetime(vol_latest.get("feature_asof"), utc=True, errors="coerce")
+        drop_feature_asof = pd.to_datetime(drop_latest.get("feature_asof"), utc=True, errors="coerce")
+        timestamps_match = (
+            not pd.isna(vol_timestamp)
+            and vol_timestamp == drop_timestamp
+            and not pd.isna(vol_feature_asof)
+            and vol_feature_asof == drop_feature_asof
+        )
+        if feature_df is not None and not feature_df.empty:
+            feature_timestamp = pd.to_datetime(feature_df.iloc[-1].get("timestamp"), utc=True, errors="coerce")
+            timestamps_match = timestamps_match and feature_timestamp == vol_feature_asof
+
+        predicted_times = [
+            pd.to_datetime(vol_latest.get("predicted_at"), utc=True, errors="coerce"),
+            pd.to_datetime(drop_latest.get("predicted_at"), utc=True, errors="coerce"),
+        ]
+        valid_until_times = [
+            pd.to_datetime(vol_latest.get("valid_until"), utc=True, errors="coerce"),
+            pd.to_datetime(drop_latest.get("valid_until"), utc=True, errors="coerce"),
+        ]
+        if not any(pd.isna(value) for value in [*predicted_times, *valid_until_times]):
+            context["feature_asof"] = vol_feature_asof
+            context["predicted_at"] = max(predicted_times)
+            context["valid_until"] = min(valid_until_times)
+
+    action, reason = evaluate_snapshot(
+        context["high_vol"],
+        context["drop_risk"],
+        feature_asof=context["feature_asof"],
+        predicted_at=context["predicted_at"],
+        valid_until=context["valid_until"],
+        timestamps_match=timestamps_match,
+    )
+    context["action_hint"] = action
+    context["action_reason"] = reason
+    if action in {UNKNOWN, STALE}:
+        warnings.append(f"Risk state is {action}: {reason}")
     return context, warnings
-
-
-def decide_action(high_vol: Any, drop_risk: Any) -> str:
-    high_vol_value = None if high_vol is None or pd.isna(high_vol) else float(high_vol)
-    drop_risk_value = None if drop_risk is None or pd.isna(drop_risk) else float(drop_risk)
-    if drop_risk_value is not None and drop_risk_value >= 0.15:
-        return "NO_TRADE"
-    if high_vol_value is not None and high_vol_value >= 0.70:
-        return "NO_TRADE"
-    if high_vol_value is not None and high_vol_value >= 0.50:
-        return "CAUTION"
-    return "NORMAL"
 
 
 def format_number(value: Any, digits: int = 4) -> str:
@@ -1602,8 +1653,19 @@ def render_header_and_risk_cards(
     timeframe: str,
     risk: dict[str, Any],
 ) -> None:
-    st.markdown(f"### BTCUSDT · {timeframe} · `{display_action_hint(risk['action_hint'])}`")
+    st.markdown(
+        f"### {BYBIT_SYMBOL} · {BYBIT_CATEGORY} · {timeframe} · "
+        f"`{display_action_hint(risk['action_hint'])}`"
+    )
+    if risk["action_hint"] == UNKNOWN:
+        st.error(f"{display_action_hint(UNKNOWN)}: {risk.get('action_reason', '')}")
+    elif risk["action_hint"] == STALE:
+        st.warning(f"{display_action_hint(STALE)}: {risk.get('action_reason', '')}")
     st.caption(t("normal_caption"))
+    st.caption(
+        f"instrument={INSTRUMENT} · feature_asof={risk.get('feature_asof') or '-'} · "
+        f"predicted_at={risk.get('predicted_at') or '-'} · valid_until={risk.get('valid_until') or '-'}"
+    )
 
     cols = st.columns(5)
     cols[0].metric(
@@ -1704,34 +1766,6 @@ def render_risk_overlay_controls() -> dict[str, Any]:
         "show_no_trade_markers": st.sidebar.checkbox(t("show_no_trade_markers"), value=True),
         "show_risk_event_table": st.sidebar.checkbox(t("show_risk_event_table"), value=True),
         "show_marker_events_only_in_table": st.sidebar.checkbox(t("show_marker_events_only_in_table"), value=True),
-        "high_vol_marker_threshold": st.sidebar.slider(
-            t("high_vol_marker_threshold"),
-            min_value=0.50,
-            max_value=0.95,
-            value=DEFAULT_HIGH_VOL_MARKER_THRESHOLD,
-            step=0.01,
-        ),
-        "drop_risk_marker_threshold": st.sidebar.slider(
-            t("drop_risk_marker_threshold"),
-            min_value=0.05,
-            max_value=0.50,
-            value=DEFAULT_DROP_RISK_MARKER_THRESHOLD,
-            step=0.01,
-        ),
-        "no_trade_high_vol_threshold": st.sidebar.slider(
-            t("no_trade_high_vol_threshold"),
-            min_value=0.50,
-            max_value=0.95,
-            value=DEFAULT_NO_TRADE_HIGH_VOL_THRESHOLD,
-            step=0.01,
-        ),
-        "no_trade_drop_risk_threshold": st.sidebar.slider(
-            t("no_trade_drop_risk_threshold"),
-            min_value=0.05,
-            max_value=0.50,
-            value=DEFAULT_NO_TRADE_DROP_RISK_THRESHOLD,
-            step=0.01,
-        ),
     }
 
 
@@ -1787,6 +1821,10 @@ def render_micro_overlay_controls() -> dict[str, Any]:
 def render_micro_risk_cards(features: pd.DataFrame, risk: dict[str, Any], current_price: float | None) -> None:
     latest = features.iloc[-1]
     st.markdown(f"### {t('micro_view_title')} · `{display_action_hint(risk['action_hint'])}`")
+    if risk["action_hint"] == UNKNOWN:
+        st.error(f"{display_action_hint(UNKNOWN)}: {risk.get('action_reason', '')}")
+    elif risk["action_hint"] == STALE:
+        st.warning(f"{display_action_hint(STALE)}: {risk.get('action_reason', '')}")
     st.caption(t("micro_view_caption"))
     cols = st.columns(7)
     cols[0].metric(t("live_btcusdt_price"), format_number(current_price, 2))
@@ -1879,10 +1917,14 @@ def render_15m_risk_overlay(
         "raw threshold event count": raw_threshold_event_count,
         "compressed marker count": compressed_marker_count,
         "risk event rows": 0 if events.empty else len(events),
-        "high-vol marker threshold": controls["high_vol_marker_threshold"],
-        "drop-risk marker threshold": controls["drop_risk_marker_threshold"],
-        "NO_TRADE high-vol threshold": controls["no_trade_high_vol_threshold"],
-        "NO_TRADE drop-risk threshold": controls["no_trade_drop_risk_threshold"],
+        "policy high-vol thresholds": (
+            HIGH_VOL_THRESHOLDS.medium,
+            HIGH_VOL_THRESHOLDS.high,
+        ),
+        "policy drop-risk thresholds": (
+            DROP_RISK_THRESHOLDS.medium,
+            DROP_RISK_THRESHOLDS.high,
+        ),
         "websocket live enabled": live_enabled,
     }
 

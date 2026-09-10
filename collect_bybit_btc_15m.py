@@ -18,13 +18,15 @@ from typing import Callable, TypeVar
 import ccxt
 import pandas as pd
 
+from market.instrument import BYBIT_CATEGORY
+
 
 # =========================
 # 수집 설정값
 # =========================
 SYMBOL = "BTC/USDT"
 TIMEFRAME = "15m"
-MARKET_TYPE = "spot"
+MARKET_TYPE = BYBIT_CATEGORY
 LOOKBACK_DAYS = 365 * 5
 FETCH_LIMIT = 1000
 MAX_RETRIES = 3

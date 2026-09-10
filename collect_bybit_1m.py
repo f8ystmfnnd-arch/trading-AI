@@ -21,9 +21,11 @@ from typing import Any
 import ccxt
 import pandas as pd
 
+from market.instrument import BYBIT_CATEGORY, BYBIT_SYMBOL
 
-SYMBOL = "BTCUSDT"
-CATEGORY = "spot"
+
+SYMBOL = BYBIT_SYMBOL
+CATEGORY = BYBIT_CATEGORY
 INTERVAL = "1"
 DAYS_TO_FETCH = 365
 FETCH_LIMIT = 1000

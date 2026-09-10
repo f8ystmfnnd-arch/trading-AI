@@ -106,3 +106,10 @@ MDD 감소는 이 프로젝트의 핵심 평가 기준이다.
 - train 기간보다 미래인 validation/test 기간으로 평가한다.
 - walk-forward 검증을 도입한다.
 - threshold와 probability calibration을 별도로 검증한다.
+- similarity scaler는 training fold에서만 fit하고 validation/test에는 transform만 적용한다.
+- 고변동 target threshold는 label이 확정된 training fold에서만 결정한다.
+- fold 경계에서는 `label_end_time`이 다음 구간을 침범하는 행을 purge한다.
+- 전략 threshold는 validation에서 선택하고 final test에는 한 번만 적용한다.
+
+기존 저장 결과에 위 metadata가 없다면 수정 전 pipeline에서 생성된 legacy 결과로 간주하며,
+누수 방지 pipeline으로 다시 검증하기 전에는 수정 후 성능으로 표시하지 않는다.

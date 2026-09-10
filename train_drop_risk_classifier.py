@@ -26,6 +26,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from evaluation.splits import purged_chronological_split
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 MPL_CONFIG_DIR = SCRIPT_DIR / ".matplotlib_cache"
@@ -86,6 +88,7 @@ EXCLUDED_FEATURE_COLUMNS = {
     "target_drop_next_4",
     "target_pump_next_4",
     "target_volatility_high_next_4",
+    "label_end_time_4",
 }
 
 PREDICTION_COLUMNS = [
@@ -171,16 +174,13 @@ def print_period(name: str, df: pd.DataFrame) -> None:
 
 
 def split_time_series(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    row_count = len(df)
-    train_end = int(row_count * 0.70)
-    validation_end = int(row_count * 0.85)
-
-    if train_end <= 0 or validation_end <= train_end or validation_end >= row_count:
-        raise ValueError("Not enough rows to split into 70% train, 15% validation, 15% test.")
-
-    train_df = df.iloc[:train_end].copy()
-    validation_df = df.iloc[train_end:validation_end].copy()
-    test_df = df.iloc[validation_end:].copy()
+    train_df, validation_df, test_df, metadata = purged_chronological_split(
+        df, 4, label_end_column="label_end_time_4"
+    )
+    print(
+        f"[purge] train {metadata.train_rows_before_purge}->{metadata.train_rows_after_purge}, "
+        f"validation {metadata.validation_rows_before_purge}->{metadata.validation_rows_after_purge}"
+    )
 
     print_period("train", train_df)
     print_period("validation", validation_df)

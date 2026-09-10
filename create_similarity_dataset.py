@@ -18,12 +18,16 @@ Run:
 
 from __future__ import annotations
 
+import argparse
 import gc
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+from evaluation.scaling import fit_training_standardizer
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -97,36 +101,54 @@ def load_input() -> pd.DataFrame:
     return df
 
 
-def select_and_scale_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[str]]:
+def default_training_fit_end(df: pd.DataFrame) -> pd.Timestamp:
+    train_end = int(len(df) * 0.70)
+    if train_end <= 0:
+        raise ValueError("Not enough rows to define the training scaler interval")
+    return pd.to_datetime(df["timestamp"].iloc[train_end - 1], utc=True)
+
+
+def saved_scaler_fit_end(scaler_path: Path) -> pd.Timestamp | None:
+    if not scaler_path.exists():
+        return None
+    try:
+        metadata = pd.read_csv(scaler_path, nrows=1)
+    except (OSError, pd.errors.ParserError):
+        return None
+    if "scaler_version" not in metadata.columns or "fit_end" not in metadata.columns or metadata.empty:
+        return None
+    value = pd.to_datetime(metadata.loc[0, "fit_end"], utc=True, errors="coerce")
+    return None if pd.isna(value) else value
+
+
+def select_and_scale_features(
+    df: pd.DataFrame,
+    fit_end: object | None = None,
+    *,
+    run_id: str = "similarity",
+    scaler_path: Path = SCALER_PATH,
+) -> tuple[pd.DataFrame, list[str], list[str]]:
     existing_features = [column for column in CANDIDATE_FEATURE_COLUMNS if column in df.columns]
     missing_features = [column for column in CANDIDATE_FEATURE_COLUMNS if column not in df.columns]
     if not existing_features:
         raise ValueError("No usable pattern feature columns were found")
 
-    feature_df = df[existing_features].apply(pd.to_numeric, errors="coerce")
-    stats_rows: list[dict[str, float | str]] = []
-    valid_features: list[str] = []
-    excluded_features = missing_features.copy()
-
-    for feature in existing_features:
-        mean = float(feature_df[feature].mean())
-        std = float(feature_df[feature].std(ddof=0))
-        if not np.isfinite(mean) or not np.isfinite(std) or std == 0:
-            excluded_features.append(feature)
-            continue
-        valid_features.append(feature)
-        stats_rows.append({"feature": feature, "mean": mean, "std": std})
-
-    if not valid_features:
-        raise ValueError("No usable feature columns remained after scaler checks")
-
-    scaler_df = pd.DataFrame(stats_rows)
-    SCALER_PATH.parent.mkdir(parents=True, exist_ok=True)
-    scaler_df.to_csv(SCALER_PATH, index=False)
-
-    scaled = feature_df[valid_features].copy()
-    for row in scaler_df.itertuples(index=False):
-        scaled[row.feature] = (scaled[row.feature] - row.mean) / row.std
+    cutoff = fit_end
+    if cutoff is None:
+        cutoff = saved_scaler_fit_end(scaler_path)
+    if cutoff is None:
+        cutoff = default_training_fit_end(df)
+    scaler, scaler_excluded = fit_training_standardizer(
+        df,
+        existing_features,
+        cutoff,
+        run_id=run_id,
+    )
+    valid_features = list(scaler.feature_names)
+    excluded_features = [*missing_features, *scaler_excluded]
+    scaled = scaler.transform(df)
+    scaler_path.parent.mkdir(parents=True, exist_ok=True)
+    scaler.metadata_frame().to_csv(scaler_path, index=False)
 
     if scaled.isna().any().any():
         nan_counts = scaled.isna().sum()
@@ -140,7 +162,8 @@ def select_and_scale_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]
     for feature in excluded_features:
         print(f"  - {feature}")
     print(f"[features] total used={len(valid_features):,}")
-    print(f"[scaler] saved: {SCALER_PATH}")
+    print(f"[scaler] fit period: {scaler.fit_start} ~ {scaler.fit_end}")
+    print(f"[scaler] saved: {scaler_path}")
     return scaled, valid_features, excluded_features
 
 
@@ -208,6 +231,46 @@ def create_raw_dataset(
     length: int,
     output_path: Path,
 ) -> tuple[int, int]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".tmp",
+        prefix=f".{output_path.name}.",
+        dir=output_path.parent,
+        delete=False,
+    ) as temp_file:
+        temp_path = Path(temp_file.name)
+
+    try:
+        shape = _write_raw_dataset(
+            scaled,
+            source_df,
+            feature_columns,
+            outcomes,
+            length,
+            temp_path,
+        )
+        validate_saved_csv_streaming(
+            temp_path,
+            outcomes,
+            length,
+            "temporary raw",
+            expected_shape=shape,
+        )
+        temp_path.replace(output_path)
+        return shape
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _write_raw_dataset(
+    scaled: pd.DataFrame,
+    source_df: pd.DataFrame,
+    feature_columns: list[str],
+    outcomes: list[str],
+    length: int,
+    output_path: Path,
+) -> tuple[int, int]:
     values = scaled[feature_columns].to_numpy(dtype=np.float32, copy=True)
     metadata = build_base_metadata(source_df, length, outcomes)
     raw_feature_columns = raw_columns(feature_columns, length)
@@ -229,7 +292,7 @@ def create_raw_dataset(
         out_df = pd.concat([metadata.iloc[start:stop].reset_index(drop=True), raw_df], axis=1)
         if out_df.isna().any().any():
             raise ValueError(f"NaN detected while writing raw vector dataset L{length}, rows {start}:{stop}")
-        out_df.to_csv(output_path, mode="a", index=False, header=not wrote_header)
+        out_df.to_csv(output_path, mode="w" if not wrote_header else "a", index=False, header=not wrote_header)
         wrote_header = True
         del chunk_arrays, raw_matrix, raw_df, out_df
         gc.collect()
@@ -246,6 +309,11 @@ def validate_dataset(df: pd.DataFrame, outcomes: list[str], length: int, label: 
         raise ValueError(f"{label} L{length} has zero rows")
     if df["window_end_timestamp"].duplicated().any():
         raise ValueError(f"{label} L{length} has duplicate window_end_timestamp values")
+    timestamps = pd.to_datetime(df["window_end_timestamp"], utc=True, errors="coerce")
+    if timestamps.isna().any() or not timestamps.is_monotonic_increasing:
+        raise ValueError(f"{label} L{length} window_end_timestamp must be valid and ordered")
+    if not (pd.to_numeric(df["pattern_length"], errors="coerce") == length).all():
+        raise ValueError(f"{label} L{length} has an invalid pattern_length value")
     if df.isna().any().any():
         raise ValueError(f"{label} L{length} contains NaN values")
 
@@ -254,6 +322,61 @@ def validate_saved_csv(path: Path, outcomes: list[str], length: int, label: str)
     df = pd.read_csv(path)
     validate_dataset(df, outcomes, length, label)
     return df.shape
+
+
+def validate_saved_csv_streaming(
+    path: Path,
+    outcomes: list[str],
+    length: int,
+    label: str,
+    expected_shape: tuple[int, int],
+) -> None:
+    header = pd.read_csv(path, nrows=0)
+    if len(header.columns) != expected_shape[1] or len(set(header.columns)) != len(header.columns):
+        raise ValueError(f"{label} L{length} has an invalid header")
+
+    row_count = 0
+    previous_timestamp: pd.Timestamp | None = None
+    for chunk in pd.read_csv(path, chunksize=RAW_CHUNK_ROWS):
+        validate_dataset(chunk, outcomes, length, label)
+        timestamps = pd.to_datetime(chunk["window_end_timestamp"], utc=True, errors="raise")
+        if previous_timestamp is not None and timestamps.iloc[0] <= previous_timestamp:
+            raise ValueError(f"{label} L{length} timestamps are duplicated or out of order")
+        previous_timestamp = timestamps.iloc[-1]
+        row_count += len(chunk)
+
+    if row_count != expected_shape[0]:
+        raise ValueError(
+            f"{label} L{length} row count mismatch: expected={expected_shape[0]} actual={row_count}"
+        )
+
+
+def save_dataframe_atomic(
+    df: pd.DataFrame,
+    output_path: Path,
+    outcomes: list[str],
+    length: int,
+    label: str,
+) -> tuple[int, int]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".tmp",
+        prefix=f".{output_path.name}.",
+        dir=output_path.parent,
+        delete=False,
+    ) as temp_file:
+        temp_path = Path(temp_file.name)
+
+    try:
+        df.to_csv(temp_path, index=False)
+        shape = validate_saved_csv(temp_path, outcomes, length, f"temporary {label}")
+        if shape != df.shape:
+            raise ValueError(f"temporary {label} L{length} shape mismatch: expected={df.shape} actual={shape}")
+        temp_path.replace(output_path)
+        return shape
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def process_length(
@@ -275,10 +398,9 @@ def process_length(
 
     summary_df = create_summary_dataset(scaled, source_df, feature_columns, outcomes, length)
     validate_dataset(summary_df, outcomes, length, "summary")
-    summary_df.to_csv(summary_path, index=False)
+    summary_shape = save_dataframe_atomic(summary_df, summary_path, outcomes, length, "summary")
     print(f"[summary] saved: {summary_path}")
     print(f"[summary] shape={summary_df.shape}")
-    summary_shape = summary_df.shape
     del summary_df
     gc.collect()
 
@@ -286,11 +408,11 @@ def process_length(
     print(f"[raw] saved: {raw_path}")
     print(f"[raw] shape={raw_shape}")
 
-    # Validate summary fully and raw header/metadata with a lightweight read to avoid reloading huge raw data.
+    # Each output is built as a fresh run in a same-directory temporary file,
+    # validated, and atomically replaces only the completed output. Resume/append
+    # of an existing dataset is intentionally not supported.
     validated_summary_shape = validate_saved_csv(summary_path, outcomes, length, "saved summary")
-    raw_head = pd.read_csv(raw_path, nrows=10)
-    validate_dataset(raw_head, outcomes, length, "saved raw sample")
-    print(f"[validate] summary shape={validated_summary_shape}, raw sample rows={len(raw_head)}")
+    print(f"[validate] summary shape={validated_summary_shape}, raw shape={raw_shape}")
     print(f"[done] pattern_length={length} completed")
 
     return {
@@ -302,9 +424,24 @@ def process_length(
     }
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Create leakage-resistant similarity datasets")
+    parser.add_argument(
+        "--scaler-fit-end",
+        help="Inclusive end timestamp of the training fold used to fit scaling statistics",
+    )
+    parser.add_argument("--run-id", default="similarity", help="Identifier stored in scaler metadata")
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     source_df = load_input()
-    scaled, feature_columns, excluded_features = select_and_scale_features(source_df)
+    scaled, feature_columns, excluded_features = select_and_scale_features(
+        source_df,
+        fit_end=args.scaler_fit_end,
+        run_id=args.run_id,
+    )
     outcomes = outcome_columns(source_df)
     print("[outcomes] outcome columns:")
     for column in outcomes:
