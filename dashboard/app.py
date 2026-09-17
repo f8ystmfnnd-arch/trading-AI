@@ -19,7 +19,9 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-DATA_DIR = Path(os.environ.get("TRADING_AI_DATA_DIR", BASE_DIR / "data"))
+OPERATIONAL_DATA_DIR = BASE_DIR / "data" / "operational" / "spot"
+DEFAULT_DATA_DIR = OPERATIONAL_DATA_DIR if (OPERATIONAL_DATA_DIR / "operational_status.json").exists() else BASE_DIR / "data"
+DATA_DIR = Path(os.environ.get("TRADING_AI_DATA_DIR", DEFAULT_DATA_DIR))
 
 from market.instrument import (
     BYBIT_CATEGORY,
@@ -1514,7 +1516,10 @@ def risk_context() -> tuple[dict[str, Any], list[str]]:
             and vol_feature_asof == drop_feature_asof
         )
         if feature_df is not None and not feature_df.empty:
-            feature_timestamp = pd.to_datetime(feature_df.iloc[-1].get("timestamp"), utc=True, errors="coerce")
+            feature_latest = feature_df.iloc[-1]
+            feature_timestamp = pd.to_datetime(
+                feature_latest.get("feature_asof", feature_latest.get("timestamp")), utc=True, errors="coerce"
+            )
             timestamps_match = timestamps_match and feature_timestamp == vol_feature_asof
 
         predicted_times = [
@@ -1540,6 +1545,23 @@ def risk_context() -> tuple[dict[str, Any], list[str]]:
     )
     context["action_hint"] = action
     context["action_reason"] = reason
+    if vol_latest is not None:
+        context["model_validation_status"] = vol_latest.get("model_validation_status")
+    status_path = DATA_DIR / "operational_status.json"
+    if status_path.exists():
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            updated = pd.to_datetime(status.get("updated_at"), utc=True, errors="coerce")
+            if status.get("status") != "ok":
+                context["action_hint"] = UNKNOWN
+                context["action_reason"] = f"데이터 갱신 검증 실패: {status.get('reason', 'unknown')}"
+            elif pd.isna(updated) or pd.Timestamp.now(tz="UTC") - updated > pd.Timedelta(minutes=3):
+                context["action_hint"] = STALE
+                context["action_reason"] = "데이터 갱신 프로세스의 최근 동작을 확인할 수 없음"
+        except (OSError, ValueError):
+            context["action_hint"] = UNKNOWN
+            context["action_reason"] = "데이터 갱신 상태 파일을 검증할 수 없음"
+    action = context["action_hint"]
     if action in {UNKNOWN, STALE}:
         warnings.append(f"Risk state is {action}: {reason}")
     return context, warnings
@@ -1649,10 +1671,14 @@ def sidebar_data_status(extra_warnings: list[str]) -> None:
             st.warning(warning)
 
 
+@st.fragment(run_every=30)
 def render_header_and_risk_cards(
     timeframe: str,
     risk: dict[str, Any],
 ) -> None:
+    risk, _ = risk_context()
+    if risk.get("model_validation_status") == "legacy_pre_fix":
+        st.warning("최신 데이터로 기존 모델을 실행 중입니다. 이 모델은 누수 수정 전 학습 결과이며 재검증이 필요합니다.")
     st.markdown(
         f"### {BYBIT_SYMBOL} · {BYBIT_CATEGORY} · {timeframe} · "
         f"`{display_action_hint(risk['action_hint'])}`"
@@ -1818,7 +1844,11 @@ def render_micro_overlay_controls() -> dict[str, Any]:
     }
 
 
+@st.fragment(run_every=30)
 def render_micro_risk_cards(features: pd.DataFrame, risk: dict[str, Any], current_price: float | None) -> None:
+    risk, _ = risk_context()
+    if risk.get("model_validation_status") == "legacy_pre_fix":
+        st.warning("최신 데이터로 기존 모델을 실행 중이며, 모델 성능은 재검증이 필요합니다.")
     latest = features.iloc[-1]
     st.markdown(f"### {t('micro_view_title')} · `{display_action_hint(risk['action_hint'])}`")
     if risk["action_hint"] == UNKNOWN:
