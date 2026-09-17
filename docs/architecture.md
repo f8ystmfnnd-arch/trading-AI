@@ -1,96 +1,36 @@
-# Architecture
+# 구조
 
-## 전체 구조
-
-`BTC Market Regime & Risk Guard AI`는 데이터 수집, 피처 생성, 모델, 리스크 엔진, 최종 판단 계층으로 나뉜다.
+## 현재 운용 흐름
 
 ```text
-data collection
-  -> feature engineering
-  -> models
-  -> risk engine
-  -> decision layer
+Bybit spot BTCUSDT + 보존된 1분봉
+  -> refresh_live_data.py: 증분 수집·완결 봉 검증
+  -> 기존 feature 함수: 멀티타임프레임·기술지표
+  -> 기존 XGBoost 모델: 고변동·급락 확률
+  -> data/operational/spot: CSV·최신성 metadata·상태
+  -> dashboard/app.py + risk/policy.py: 위험 상태·차트
 ```
 
-## 1. 데이터 수집
+- `market/instrument.py`: 과거 수집과 현재 표시의 spot category·symbol을 통일한다.
+- `risk/policy.py`: 고변동·급락 threshold와 monotonic 보호 정책을 관리한다.
+- `evaluation/`: training-only scaler·target threshold, 시간 순서 split·purge, validation 기반 threshold 선택을 제공한다.
+- `tests/`: CSV 재실행, 정책, 최신성, 누수 방지, 운용 분봉 검증을 작은 fixture로 확인한다.
 
-데이터 수집 계층은 시장 상태를 판단하기 위한 원천 데이터를 모은다.
+대시보드는 가격 표시와 예측 시각을 구분한다. 현재가는 예측의 유효 시간을 연장하지 않는다.
+갱신 오류나 timestamp 불일치는 정상 상태를 만들지 않는다.
+기존 모델의 `legacy_pre_fix` 경고는 모델 재검증 전까지 유지한다.
 
-- Bybit `BTCUSDT` 1m OHLCV 캔들
-- 5m / 15m / 1h / 4h / 1d 리샘플 데이터
-- 실시간 차트 데이터
-- 뉴스 데이터
-- 거시 이벤트 데이터
-- 향후 추가 가능한 funding rate, open interest, liquidation data
+## 별도 연구 경로
 
-우선순위는 `collect_bybit_1m.py`에 `--days`, `--update` 기능을 안정적으로 추가하는 것이다. `--watch`는 실시간 대시보드 단계에서 다룬다.
+루트 수집·학습·유사도·백테스트 스크립트는 별도로 실행한다.
+운용 프로세스는 학습, 전체 similarity 생성, 자동 주문을 실행하지 않는다.
+상세 파일 안내는 [repository-guide.md](repository-guide.md)를 참고한다.
 
-## 2. 피처 생성
+## 향후 설계
 
-피처 생성 계층은 가격과 거래량을 모델이 사용할 수 있는 설명 변수로 변환한다.
+시장 국면 분류, 뉴스 심각도·거시 이벤트 리스크, funding·open interest,
+Day Trading / Swing Trading 모드, 확률 calibration은 추가 검증 및 구현 계획이다.
+현재 운용에 모두 구현된 기능으로 설명하지 않는다.
+뉴스는 변동성·불확실성을 평가하는 보조 정보로 사용한다.
 
-- 멀티타임프레임 가격 수익률 피처
-- 이동평균과 이격도 피처
-- 변동성 피처
-- 거래량 피처
-- 시장 국면 판단용 피처
-- 뉴스 심각도와 이벤트 위험도 피처
-- 15m / 1h / 1d 멀티호라이즌 리스크 타깃
-
-이 계층에서 lookahead bias가 생기지 않도록 미래 데이터를 현재 피처에 섞지 않아야 한다.
-
-## 3. 모델
-
-모델 계층은 방향성 자체보다 리스크 상태를 판단하는 데 중심을 둔다.
-
-- 방향성 분류 모델
-- 고변동 예측 모델
-- 급락 위험 예측 모델
-- 시장 국면 분류 모델
-- 뉴스 심각도 분석 모델
-- 유사 과거 패턴 기반 리스크 분석 모델
-
-방향성 예측은 보조 신호다. 핵심 모델은 고변동, 급락, 시장 국면을 판단하는 모델이다.
-
-## 4. 리스크 엔진
-
-리스크 엔진은 차트, 모델, 뉴스 판단을 통합해 위험 점수를 만든다.
-
-- `chart_risk_score`
-- `news_risk_score`
-- `volatility_risk_score`
-- `drop_risk_score`
-- `regime_score`
-
-뉴스는 매수/매도 방향 신호가 아니라 변동성, 불확실성, 위험도 판단에 사용한다. 예를 들어 긍정 뉴스라도 과열과 변동성 확대를 유발할 수 있고, 부정 뉴스라도 이미 가격에 반영되었을 수 있다.
-
-## 5. 최종 판단 계층
-
-최종 판단 계층은 모델 출력과 리스크 점수를 사람이 이해할 수 있는 행동 판단으로 바꾼다.
-
-- 정상 거래 가능
-- 주의
-- 포지션 축소
-- 신규 진입 금지
-- 강제 휴식
-- 전략 전환
-
-이 계층은 자동 매매 수익을 보장하기 위한 것이 아니라, 데이트레이딩과 스윙 매매에서 위험을 관리하기 위한 의사결정 보조 계층이다.
-
-## Trading Modes
-
-### Day Trading Mode
-
-`Day Trading Mode`는 짧은 시간 단위의 신규 진입 위험과 단기 변동성 위험을 판단한다.
-
-- 주요 타임프레임: 1m, 5m, 15m, 1h
-- 주요 판단: 다음 15m 방향성, 다음 1h 고변동 가능성, 다음 1h 급락 위험, 당일 변동성 상태
-- 주요 사용처: 신규 진입 가능 여부, 포지션 크기 조절, 단기 손절/익절 전략 보조
-
-### Swing Trading Mode
-
-`Swing Trading Mode`는 며칠 단위의 시장 국면과 포지션 유지 위험을 판단한다.
-
-- 주요 타임프레임: 15m, 1h, 4h, 1d
-- 주요 판단: 다음 4h 변동성, 다음 1d 변동성, 다음 1d 급락 위험, 시장 국면
-- 주요 사용처: 기존 포지션 유지 여부, 스윙 신규 진입 가능 여부, 방어적 전환 판단
+계획은 [roadmap.md](roadmap.md), 평가 기준은 [evaluation.md](evaluation.md)에 둔다.

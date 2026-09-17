@@ -1,222 +1,108 @@
 # BTC Market Regime & Risk Guard AI
 
-BTC Market Regime & Risk Guard AI는 BTCUSDT 시장의 가격 방향을 맞히는 자동매매 봇이 아니라, 시장 국면과 위험 상태를 읽기 위한 리스크 관리 보조 도구입니다.
+Bybit **spot BTCUSDT**의 시장 위험을 확인하는 Streamlit 대시보드입니다.
+고변동·급락 가능성과 과거 유사 구간을 참고해 사람이 위험을 판단하도록 돕습니다.
 
-이 프로젝트의 핵심은 다음 질문에 답하는 것입니다.
+## 현재 상태
 
-- 지금 시장이 정상적인 구간인가, 고변동 구간인가?
-- 다음 1시간 동안 변동성이 커질 가능성이 높은가?
-- 급락 위험이 커지고 있는가?
-- 현재 차트와 비슷했던 과거 구간에서는 이후에 어떤 일이 자주 일어났는가?
-- 신규 진입, 포지션 축소, 관망 같은 판단을 할 때 어떤 위험 정보를 참고해야 하는가?
+| 영역 | 구현 및 제한 |
+| --- | --- |
+| 데이터 | 1분봉 증분 수집, 완결 봉만 5m·15m·1h·4h·1d 리샘플링 |
+| 실시간 추론 | 기존 모델로 최신 완결 15분봉의 고변동·급락 확률 계산 |
+| 위험 정책 | `NORMAL`, `CAUTION`, `NO_TRADE`, `UNKNOWN`, `STALE` 공통 정책 |
+| 대시보드 | 일반 차트, 15m Risk Overlay, 1m Live Micro View |
+| 유사도 | 기존 분석·백테스트 제공. 최신 운용 갱신에 자동 연결되지 않음 |
+| 모델 검증 | 기존 모델은 `legacy_pre_fix`. 누수 수정 후 성능 재검증 필요 |
 
-방향성 예측 모델은 보조 신호입니다. 핵심은 고변동 위험, 급락 위험, 유사패턴 위험, 시장 판세를 함께 보여주는 `Risk Guard`입니다.
+2026-09-16 로컬 운용 연결 시 약 273만 개의 1분봉을 확인했습니다.
+CSV와 모델이 모두 GitHub에 포함되는 것은 아니므로 clone만으로 예측이 생성되지는 않습니다.
 
-## What This Project Is / Is Not
+## 시작하기
 
-### This Project Is
-
-- BTCUSDT 시장 국면과 리스크를 분석하는 도구
-- 고변동 가능성 판단 보조 도구
-- 급락 위험 판단 보조 도구
-- 과거 유사 패턴 기반 리스크 참고 도구
-- Streamlit 기반 대시보드
-- 데이트레이딩/스윙 판단 전에 시장 분위기를 확인하는 보조 시스템
-
-### This Project Is Not
-
-- 수익을 보장하는 시스템
-- 자동 매수/매도 봇
-- 단독으로 진입과 청산을 결정하는 신호 시스템
-- 금융 조언 또는 투자 자문
-
-## Current Features
-
-- Bybit `BTCUSDT` 1분봉 데이터 수집과 업데이트
-- 1분봉 원본 데이터 기반 `5m`, `15m`, `1h`, `4h`, `1d` 리샘플링
-- 15분봉 중심 멀티타임프레임 feature 생성
-- 기술지표 feature 생성
-  - Bollinger Band
-  - ATR
-  - MA slope
-  - RSI slope
-- 다음 1시간 고변동 예측 classifier
-- 다음 1시간 급락 위험 classifier
-- Historical Similarity Pattern Analysis
-- Streamlit dashboard
-- TradingView-style candlestick chart
-- Bybit WebSocket live price display
-- WebSocket 실패 시 REST fallback 가격 표시
-
-## Quick Start
-
-새 노트북이나 새 컴퓨터에서는 먼저 repo를 clone합니다.
+프로젝트 루트에서 실행합니다.
 
 ```powershell
 git clone https://github.com/f8ystmfnnd-arch/trading-AI.git
 cd trading-AI
-```
-
-Python 가상환경을 만들고 패키지를 설치합니다.
-
-```powershell
 py -3 -m venv .venv
-.\.venv\Scripts\activate
-pip install -r requirements.txt
+./.venv/Scripts/python.exe -m pip install -r requirements.txt
 ```
 
-대시보드를 실행합니다.
+### 현재 PC의 로컬 운용
 
 ```powershell
-.\.venv\Scripts\python.exe -m streamlit run dashboard/app.py
+./start_dashboard.ps1
 ```
 
-브라우저에서 아래 주소로 접속합니다.
+접속: [http://localhost:8504](http://localhost:8504)
 
-```text
-http://localhost:8501
-```
+실행 스크립트의 기본 Python·원본·모델 경로는 현재 PC의 기존 환경입니다.
+다른 PC에서는 아래처럼 경로를 명시하고 두 프로세스를 각각 실행하세요.
 
-## Data Update / Rebuild Pipeline
+### 다른 PC에서 실행
 
-`data/`, `model/`, `experiments/`는 GitHub에 올리지 않는 로컬 산출물입니다. 새 컴퓨터에서는 기존 산출물을 복사하거나 아래 파이프라인으로 재생성해야 합니다.
+기존 spot 1분봉 원본과 아래 두 모델을 별도로 준비합니다.
 
-모든 명령은 프로젝트 루트에서 실행합니다.
+- `xgb_volatility_classifier_with_indicators.json`
+- `xgb_drop_risk_classifier.json`
+
+첫 번째 터미널:
 
 ```powershell
-cd C:\Users\skana\dev\trading-AI
+./.venv/Scripts/python.exe refresh_live_data.py --seed-raw "D:/artifacts/BTCUSDT_1m.csv" --model-dir "D:/artifacts/model" --watch
 ```
 
-기존 `data/raw/BTCUSDT_1m.csv`가 있다면 증분 업데이트를 사용합니다.
+두 번째 터미널:
 
 ```powershell
-.\.venv\Scripts\python.exe collect_bybit_1m.py --update
+$env:TRADING_AI_DATA_DIR = Join-Path (Get-Location) 'data/operational/spot'
+./.venv/Scripts/python.exe -m streamlit run dashboard/app.py --server.address 127.0.0.1 --server.port 8504
 ```
 
-처음부터 테스트 데이터를 만들 때는 기간을 지정할 수 있습니다.
+첫 실행이 성공하면 `data/operational/spot/operational_status.json`이 생성됩니다.
+최근 12일의 연속 분봉과 모델의 피처 스키마가 필요합니다.
+기존 산출물 없이 시작하려면 [연구 파이프라인](docs/pipeline.md)을 참고하세요.
+학습과 전체 재생성은 실시간 실행의 필수 명령으로 묶지 않았습니다.
+
+## 데이터와 판단의 최신성
+
+- 수집은 갱신 완료 후 60초 간격, 리스크 카드는 30초 간격으로 확인합니다.
+- `feature_asof`는 완결된 15분봉 종료 시각입니다.
+- 예측은 다음 15분봉 종료까지 유효하며 재실행으로 유효 시간을 연장하지 않습니다.
+- 예측 부재·불일치·검증 실패는 `UNKNOWN`, 만료 또는 수집 상태 지연은 `STALE`입니다.
+- 최신 추론 실행은 모델 성능 재검증 완료를 의미하지 않습니다.
+
+## 구조와 문서
+
+| 경로 | 역할 |
+| --- | --- |
+| 루트 `*.py` | 수집·피처·학습·분석·백테스트 진입점 |
+| `dashboard/` | 화면과 차트 |
+| `market/` | 거래소 category·symbol 공통 상수 |
+| `risk/` | 위험 임계값과 공통 정책 |
+| `evaluation/` | 시간 분할·scaler·target·threshold 검증 |
+| `tests/` | 작은 synthetic fixture 기반 회귀 테스트 |
+| `docs/` | 운용 안내·설계·계획·개발일지 |
+
+- [로컬 운용](docs/live-operation.md)
+- [데이터·연구 파이프라인](docs/pipeline.md)
+- [현재 구조와 계획 구분](docs/architecture.md)
+- [저장소 관리 및 파일 안내](docs/repository-guide.md)
+- [평가 기준](docs/evaluation.md) · [로드맵](docs/roadmap.md)
+- [개발일지](docs/notes/)
+
+## 테스트
 
 ```powershell
-.\.venv\Scripts\python.exe collect_bybit_1m.py --days 365 --force-refresh
+./.venv/Scripts/python.exe -m unittest discover -s tests
 ```
 
-주의: `--force-refresh`는 기존 raw CSV를 백업한 뒤 새로 수집하는 모드입니다. 기존 데이터를 덮어쓰기 전에 백업 경로를 확인하세요.
+2026-09-17 기준 17개 테스트 통과. 대형 데이터 생성·모델 학습 없이 실행합니다.
 
-전체 재생성 순서:
+## 산출물 관리
 
-```powershell
-.\.venv\Scripts\python.exe collect_bybit_1m.py --update
-.\.venv\Scripts\python.exe resample_ohlcv.py
-.\.venv\Scripts\python.exe check_data_quality.py
-.\.venv\Scripts\python.exe create_features_multi_timeframe.py
-.\.venv\Scripts\python.exe create_risk_targets.py
-.\.venv\Scripts\python.exe create_swing_targets.py
-.\.venv\Scripts\python.exe create_features_with_indicators.py
-.\.venv\Scripts\python.exe train_volatility_classifier_with_indicators.py
-.\.venv\Scripts\python.exe train_drop_risk_classifier.py
-.\.venv\Scripts\python.exe create_similarity_dataset.py
-.\.venv\Scripts\python.exe analyze_similar_patterns.py --pattern-length 48 --top-k 100
-```
+새 데이터·모델·실험·로그·패키지는 Git 추적 대상에서 제외합니다.
+과거부터 추적 중인 `data/btc_15m*.csv`, `model/` 및 실험 요약은 보존합니다.
+이 legacy 파일들은 현재 운용 입력 전체를 대신하지 않습니다.
 
-`analyze_similar_patterns.py`는 아래와 같은 raw similarity dataset을 먼저 필요로 합니다.
-
-```text
-data/processed/similarity/BTCUSDT_15m_similarity_raw_L48.csv
-```
-
-따라서 새 컴퓨터처럼 `data/processed/similarity/`가 비어 있는 환경에서는 `create_similarity_dataset.py`를 먼저 실행해야 합니다. 이미 similarity dataset이 있다면 이 단계는 생략하고 `analyze_similar_patterns.py`만 다시 실행해도 됩니다.
-
-5년치 기준 `create_similarity_dataset.py`는 오래 걸릴 수 있고 raw vector CSV 파일도 매우 커질 수 있습니다. 처음 실행할 때는 디스크 용량과 실행 시간을 먼저 확인하세요.
-
-## Dashboard
-
-실행 명령:
-
-```powershell
-.\.venv\Scripts\python.exe -m streamlit run dashboard/app.py
-```
-
-접속 주소:
-
-```text
-http://localhost:8501
-```
-
-대시보드에서 확인할 수 있는 정보:
-
-- BTCUSDT candlestick chart
-- timeframe selector: `1m`, `5m`, `15m`, `1h`, `4h`, `1d`
-- high-vol probability
-- drop risk probability
-- ATR ratio
-- Bollinger Band width
-- moving averages
-- action hint
-- latest similarity pattern summary
-- 15m Risk Overlay mode: latest 1,000 15m candles with optional MA, Bollinger, high-vol, drop-risk, and NO_TRADE markers
-- 1m Live Micro View: latest 1,000 1m candles with micro volatility, volume spike, and fast move event markers
-
-대시보드가 주로 참조하는 파일:
-
-```text
-data/raw/BTCUSDT_1m.csv
-data/resampled/BTCUSDT_5m.csv
-data/resampled/BTCUSDT_15m.csv
-data/resampled/BTCUSDT_1h.csv
-data/resampled/BTCUSDT_4h.csv
-data/resampled/BTCUSDT_1d.csv
-data/processed/BTCUSDT_15m_features_with_indicators.csv
-data/processed/BTCUSDT_15m_volatility_predictions_with_indicators.csv
-data/processed/BTCUSDT_15m_drop_risk_predictions.csv
-data/processed/similarity/
-```
-
-Bybit WebSocket live price는 화면 표시용입니다. 현재 구조는 live price를 CSV에 자동 저장하는 collector가 아닙니다. 모델 판단은 사전에 생성된 15분봉 feature와 prediction CSV를 기준으로 합니다.
-
-## Local Artifacts and Git Policy
-
-아래 폴더는 로컬 산출물입니다.
-
-```text
-data/
-model/
-models/
-experiments/
-```
-
-이 폴더들은 보통 GitHub에 올리지 않습니다. GitHub에는 코드와 문서 중심으로 관리합니다.
-
-새 컴퓨터에서 실행하려면 선택지는 두 가지입니다.
-
-1. 기존 컴퓨터의 `data/`와 `model/` 산출물을 복사한다.
-2. 이 README의 pipeline 순서대로 데이터를 다시 수집하고 feature/model/prediction 파일을 재생성한다.
-
-대용량 데이터와 모델 파일을 정리할 때는 삭제보다 백업을 우선합니다.
-
-## Documentation Map
-
-- `docs/project-overview.md`: 프로젝트 방향과 문제의식
-- `docs/architecture.md`: 전체 구조와 의사결정 계층
-- `docs/pipeline.md`: 데이터 수집, feature, model, backtest 흐름
-- `docs/evaluation.md`: 평가 철학과 리스크 중심 지표
-- `docs/roadmap.md`: 개발 단계와 다음 기능
-- `docs/notes/`: 날짜별 개발 메모
-- `AGENTS.md`: Codex 작업 규칙
-
-## Roadmap
-
-- real-time WebSocket collector
-- real-time 1m/15m candle builder
-- dashboard indicator on/off controls
-- high-vol probability sub-chart
-- similarity risk cards
-- drop-risk and high-vol combined risk score
-- Day Trading Mode / Swing Trading Mode 화면 분리
-- mental/behavior guard features
-
-## Important Notes
-
-- 이 프로젝트는 자동매매 수익 보장 시스템이 아닙니다.
-- 대시보드의 `action_hint`는 매수/매도 신호가 아니라 리스크 참고 상태입니다.
-- time-series 데이터는 시간 순서를 유지해야 합니다.
-- feature 생성, target 생성, backtest에서는 lookahead bias가 생기지 않도록 주의해야 합니다.
-- 방향성 모델은 보조 신호이며, 핵심 판단은 고변동 위험, 급락 위험, 유사패턴 위험, 시장 국면을 종합해서 봅니다.
+이 도구는 자동 주문을 실행하지 않습니다. 위험 상태는 매수·매도 지시나 수익 보장이 아닙니다.

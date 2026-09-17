@@ -1,178 +1,58 @@
-# Pipeline
+# 데이터와 연구 파이프라인
 
-## 원칙
+명령은 저장소 루트에서 실행한다. 현재 진입점은 루트 `*.py`이며 `scripts/` 경로는 사용하지 않는다.
 
-모든 명령은 프로젝트 루트에서 실행한다.
+## 운용 경로
 
-```powershell
-cd C:\Users\MinJae\Documents\코덱스
-```
-
-데이터, 모델, 대용량 결과 파일은 GitHub에 올리지 않는 방향으로 관리한다. 중요한 해석과 결론은 `docs/` 또는 작은 Markdown 요약으로 남긴다.
-
-## 1. 1m 데이터 수집
-
-주요 스크립트:
-
-- `scripts/collect/collect_bybit_1m.py`
-
-목표 입력:
-
-- Bybit `BTCUSDT` 1m OHLCV
-
-목표 출력:
-
-- `data/raw/BTCUSDT_1m.csv`
-- `data/raw/backups/`
-
-우선 구현 방향:
+`refresh_live_data.py --watch`는 spot 1분봉 이후 데이터를 증분 수집하고,
+완결 봉 검증 → 리샘플링 → 미래 target 없는 최신 피처 → 기존 모델 추론 순서로 실행한다.
+학습이나 전체 백테스트를 실행하지 않는다.
 
 ```powershell
-python scripts/collect/collect_bybit_1m.py --days 365
-python scripts/collect/collect_bybit_1m.py --update
+python refresh_live_data.py --seed-raw "D:/artifacts/BTCUSDT_1m.csv" --model-dir "D:/artifacts/model" --watch
 ```
 
-`--days`는 지정한 기간만큼 과거 데이터를 수집한다. `--update`는 기존 `data/raw/BTCUSDT_1m.csv`의 마지막 `timestamp` 이후 데이터만 받아 append하고, 중복 제거와 정렬을 수행한다.
+출력은 기본 `data/operational/spot/`이다.
 
-`--watch`는 나중에 실시간 Risk Dashboard 단계에서 다룬다.
+| 하위 경로 | 내용 |
+| --- | --- |
+| `raw/BTCUSDT_1m.csv` | 보존된 분봉과 증분 수집 결과 |
+| `resampled/BTCUSDT_*.csv` | 모든 구성 분봉이 존재하는 완결 봉 |
+| `processed/BTCUSDT_15m_features_with_indicators.csv` | 최신 최대 1,000개 피처 |
+| `processed/BTCUSDT_15m_volatility_predictions_with_indicators.csv` | 고변동 확률과 최신성 metadata |
+| `processed/BTCUSDT_15m_drop_risk_predictions.csv` | 급락 확률과 최신성 metadata |
+| `operational_status.json` | 갱신 성공·실패, 시각, instrument |
 
-## 2. 리샘플
+파일은 임시 파일에서 atomic 교체한다. 기존 seed와 모델은 읽기만 한다.
+최신성 및 실패 처리는 [로컬 운용 문서](live-operation.md)를 따른다.
+similarity 결과는 이 경로에서 새로 생성하지 않는다.
 
-주요 스크립트:
+## 연구 경로
 
-- `scripts/collect/resample_ohlcv.py`
+별도로 실행하는 기존 연구 스크립트 목록이다. 전체 명령을 무조건 연속 실행하지 않는다.
+입력·출력과 기존 파일 보존 여부를 확인하고 필요한 단계만 실행한다.
 
-입력 파일:
+| 단계 | 루트 스크립트 | 주요 입력·출력 |
+| --- | --- | --- |
+| 수집 | `collect_bybit_1m.py --update` | `data/raw/BTCUSDT_1m.csv` 이후 분봉 |
+| 초기 수집 | `collect_bybit_1m.py --days 30` | 원본이 없는 환경의 제한된 기간 |
+| 리샘플·품질 | `resample_ohlcv.py`, `check_data_quality.py` | `data/raw/` → `data/resampled/` |
+| 피처 | `create_features_multi_timeframe.py` | `data/processed/BTCUSDT_15m_features.csv` |
+| 리스크 타깃 | `create_risk_targets.py`, `create_swing_targets.py` | training 구간 임계값으로 생성 |
+| 기술지표 | `create_features_with_indicators.py` | 지표를 추가한 피처·타깃 |
+| 학습 | `train_volatility_classifier_with_indicators.py`, `train_drop_risk_classifier.py`, `train_xgboost_multi_timeframe.py` | `model/` 및 prediction 산출물 |
+| 유사도 | `create_similarity_dataset.py`, `analyze_similar_patterns.py` | `data/processed/similarity/` |
+| 백테스트 | `backtest_similarity_risk.py`, `backtest_volatility_risk_filter.py`, `backtest_xgboost_signal.py` | 연구용 거래·자산·요약 |
 
-- `data/raw/BTCUSDT_1m.csv`
+similarity 생성은 새 run이며 기존 CSV에 이어붙이지 않는다.
+대용량 생성과 `--force-refresh`는 일상 운용 명령이 아니다.
+학습 결과를 운용에 반영하기 전 시간 순서 검증과 모델 provenance 확인이 필요하다.
 
-출력 파일:
+## 남은 검증
 
-- `data/resampled/BTCUSDT_5m.csv`
-- `data/resampled/BTCUSDT_15m.csv`
-- `data/resampled/BTCUSDT_1h.csv`
-- `data/resampled/BTCUSDT_4h.csv`
-- `data/resampled/BTCUSDT_1d.csv`
+- 기존 모델을 누수 방지 구조로 재검증하고 확률 calibration을 평가한다.
+- F04 similarity 백테스트의 연속 시간축 accounting을 수정한다.
+- F05 futures TP/SL PnL 중복 계산을 수정한다.
+- fee·MDD·Sharpe 공통 지표를 정리한다.
 
-실행:
-
-```powershell
-python scripts/collect/resample_ohlcv.py
-python scripts/collect/check_data_quality.py
-```
-
-## 3. 멀티타임프레임 피처 생성
-
-주요 스크립트:
-
-- `scripts/features/create_features_multi_timeframe.py`
-
-입력 파일:
-
-- `data/resampled/BTCUSDT_5m.csv`
-- `data/resampled/BTCUSDT_15m.csv`
-- `data/resampled/BTCUSDT_1h.csv`
-- `data/resampled/BTCUSDT_4h.csv`
-- `data/resampled/BTCUSDT_1d.csv`
-
-출력 파일:
-
-- `data/processed/BTCUSDT_15m_features.csv`
-
-실행:
-
-```powershell
-python scripts/features/create_features_multi_timeframe.py
-```
-
-## 4. 리스크 타깃 생성
-
-주요 스크립트:
-
-- `scripts/features/create_risk_targets.py`
-- `scripts/features/create_swing_targets.py`
-
-입력 파일:
-
-- `data/processed/BTCUSDT_15m_features.csv`
-- `data/resampled/BTCUSDT_15m.csv`
-
-출력 파일:
-
-- `data/processed/BTCUSDT_15m_risk_targets.csv`
-- 스윙 매매용 타깃 파일
-
-핵심 타깃:
-
-- 15m 단기 방향성
-- 1h 고변동 가능성
-- 1h 급락 위험
-- 1d 시장 국면과 리스크 상태
-
-## 5. 유사 패턴 데이터셋
-
-주요 스크립트:
-
-- `scripts/features/create_similarity_dataset.py`
-- `scripts/analysis/analyze_similar_patterns.py`
-
-입력 파일:
-
-- `data/processed/BTCUSDT_15m_features.csv`
-
-출력 파일:
-
-- `data/processed/similarity/`
-
-목적:
-
-최근 시장 패턴과 과거 유사 구간을 비교해 이후 고변동, 급락, 큰 움직임이 얼마나 자주 발생했는지 참고한다.
-
-## 6. 모델 학습
-
-주요 스크립트:
-
-- `scripts/train/train_xgboost_multi_timeframe.py`
-- `scripts/train/train_volatility_classifier.py`
-- `scripts/train/train_drop_risk_classifier.py`
-
-입력 파일:
-
-- `data/processed/BTCUSDT_15m_features.csv`
-- `data/processed/BTCUSDT_15m_risk_targets.csv`
-
-출력 파일:
-
-- `model/xgb_multi_timeframe_classifier.json`
-- `model/xgb_volatility_classifier.json`
-- `model/xgb_drop_risk_classifier.json`
-- `data/processed/*_predictions.csv`
-- feature importance plot
-
-## 7. 백테스트
-
-주요 스크립트:
-
-- `scripts/backtest/backtest_xgboost_signal.py`
-- `scripts/backtest/backtest_volatility_risk_filter.py`
-- `scripts/backtest/backtest_similarity_risk.py`
-
-입력 파일:
-
-- `data/processed/*_predictions.csv`
-- `data/processed/BTCUSDT_15m_risk_targets.csv`
-- `data/resampled/BTCUSDT_15m.csv`
-
-출력 파일:
-
-- `data/processed/*_backtest.csv`
-- `data/processed/*_summary.csv`
-- `model/*_equity_curve.png`
-
-평가 관점:
-
-- 단순 수익률보다 MDD 감소
-- 고변동 구간 회피
-- 급락 구간 회피
-- exposure 조절
-- fee impact 관리
+문서 정리는 연구 결함 수정이나 모델 성능 검증 완료를 의미하지 않는다.

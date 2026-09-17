@@ -1,5 +1,16 @@
 # Roadmap
 
+## 2026-09-17 현재 우선순위
+
+spot 증분 수집·최신 추론·UNKNOWN/STALE 정책·로컬 대시보드 연결은 구현됐다.
+아래 Phase 목록은 장기 방향으로 보존하며 모든 항목을 미구현으로 해석하지 않는다.
+
+1. 누수 수정 이후 기존 모델을 시간 순서로 재검증하고 calibration 및 provenance를 확인한다.
+2. F04 similarity accounting, F05 futures TP/SL PnL 중복 계산을 수정한다.
+3. fee·MDD·Sharpe 공통 지표와 최신 similarity query 경로를 정리한다.
+
+뉴스·새 모델·투자선 기능보다 현재 결과를 검증하는 작업을 우선한다.
+
 ## 개발 방향
 
 이 프로젝트는 가격 예측 AI가 아니라 `BTC Market Regime & Risk Guard AI`이다. 개발 우선순위는 수익률 극대화보다 리스크 판단 정확도와 백테스트 검증에 둔다.

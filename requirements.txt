@@ -1,7 +1,8 @@
-ccxt
-numpy
 pandas
+numpy
+requests
+matplotlib
 scikit-learn
 xgboost
-matplotlib
+ccxt
 streamlit

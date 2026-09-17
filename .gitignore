@@ -26,7 +26,16 @@ desktop.ini
 *.tmp
 *.bak
 
-# Project generated artifacts
+# Local artifacts (existing tracked files remain preserved)
 data/
 model/
+models/
 experiments/
+work/
+.runtime-packages/
+
+# Credentials and local settings
+.env
+.env.*
+!.env.example
+*.pid
